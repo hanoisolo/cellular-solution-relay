@@ -204,7 +204,60 @@ async def main():
             m.get("type") == "text" and m.get("last") is True for m in received
         ), "no reply after interrupt — session did not recover"
         print("RECOVERY: pass — session answers again after an interrupt")
+
+        # Handoff via keyword: asking for a representative must end the
+        # session with an "end" message carrying handoffData.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "I'd like to speak to a representative please",
+                    "lang": "en-CA",
+                    "last": True,
+                }
+            )
+        )
+        end_msg = None
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                m = json.loads(raw)
+                print("RECV (handoff):", json.dumps(m)[:200])
+                if m.get("type") == "end":
+                    end_msg = m
+                    break
+        except asyncio.TimeoutError:
+            pass
+        assert end_msg is not None, "no end message on representative request"
+        hd = json.loads(end_msg.get("handoffData") or "{}")
+        assert hd.get("reason") == "caller-requested-human" and hd.get("callSid"), (
+            f"bad handoffData: {hd}"
+        )
+        print("HANDOFF (keyword): pass — end + handoffData sent")
         await ws.close()
+
+    # Handoff via DTMF 0 on a fresh session.
+    setup2 = dict(SETUP)
+    setup2["callSid"] = "CAtest0000000000000000000000000001"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws2:
+        await ws2.send(json.dumps(setup2))
+        await asyncio.wait_for(ws2.recv(), timeout=10)  # disclosure token
+        await ws2.send(json.dumps({"type": "dtmf", "digit": "0"}))
+        end_msg = None
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws2.recv(), timeout=5)
+                m = json.loads(raw)
+                if m.get("type") == "end":
+                    end_msg = m
+                    break
+        except asyncio.TimeoutError:
+            pass
+        assert end_msg is not None, "no end message on DTMF 0"
+        hd = json.loads(end_msg.get("handoffData") or "{}")
+        assert hd.get("reason") == "dtmf-0", f"bad handoffData: {hd}"
+        print("HANDOFF (dtmf 0): pass — end + handoffData sent")
+        await ws2.close()
 
     check_signature_validator()
     check_truncation()

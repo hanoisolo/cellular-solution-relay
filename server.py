@@ -396,6 +396,14 @@ NAME_RES = [
     re.compile(r"\bname'?s ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
 ]
 
+# The caller asks for a person ("representative", "agent", "a real person").
+# Matching this hands the call to the store instead of answering.
+HANDOFF_RE = re.compile(
+    r"\b(representative|agent|human|operator|real person|live person|"
+    r"talk to (a |an )?person|speak to (a |an )?(person|someone)|someone real)\b",
+    re.IGNORECASE,
+)
+
 
 def _truncate_to_utterance(spoken: str, utterance: str) -> str:
     """Cut a spoken reply down to what the caller actually heard.
@@ -646,9 +654,16 @@ def conversation_relay_xml(ws_url: str, greeting: str) -> str:
         tts_attrs += f'ttsProvider="{RELAY_TTS_PROVIDER}" '
     if RELAY_TTS_VOICE:
         tts_attrs += f'voice="{RELAY_TTS_VOICE}" '
+    # <Connect> action URL: when the ConversationRelay session ends — the relay
+    # sends "end" for a human handoff, or the WebSocket drops — Twilio POSTs
+    # here and the call continues from /handoff (dials the store) instead of
+    # dying in silence.
+    action_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    if action_url.endswith("/ws"):
+        action_url = action_url[: -len("/ws")] + "/handoff"
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response><Connect>"
+        f'<Response><Connect action="{escape_attr(action_url)}">'
         f'<ConversationRelay url="{ws_url}" '
         f'welcomeGreeting="{escape_attr(greeting)}" '
         f'language="{RELAY_LANGUAGE}" '
@@ -703,6 +718,36 @@ async def twiml_outbound(request: Request) -> Response:
     """TwiML for outbound dials: same relay, but the greeting introduces
     the call instead of thanking the person for calling."""
     return await _twiml_response(request, _env_or("RELAY_OUTBOUND_GREETING", OUTBOUND_GREETING))
+
+
+@app.post("/handoff")
+async def handoff_action(request: Request) -> Response:
+    """Action URL of <Connect>: fires when the relay session ends (human
+    handoff via the "end" message, or a dropped WebSocket). Connects the
+    caller to the store line so they always reach a person."""
+    token = _twilio_auth_token()
+    body = await request.body()
+    params = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+    if token:
+        signature = request.headers.get("x-twilio-signature", "")
+        url = public_http_url(request)
+        if not signature or not twilio_signature_valid(url, params, signature, token):
+            log_event("handoff_signature_rejected", url=url)
+            return Response(content="Forbidden", status_code=403)
+    log_event(
+        "handoff_action",
+        callSid=params.get("CallSid", ""),
+        handoffData=(params.get("HandoffData") or "")[:500],
+    )
+    store = os.environ.get("RELAY_STORE_NUMBER", "").strip() or "+19052642228"
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        "<Say>Connecting you to our store now.</Say>"
+        f'<Dial timeout="30"><Number>{_xml_escape(store)}</Number></Dial>'
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +902,19 @@ async def relay_ws(websocket: WebSocket) -> None:
     # Accumulates the text already sent to Twilio for the in-flight reply, so
     # an interrupt can truncate history to what the caller actually heard.
     spoken_box = [""]
+
+    async def do_handoff(reason: str, extra: dict | None = None) -> None:
+        """End the relay session; Twilio then POSTs the action URL (/handoff)
+        and the caller is connected to the store line."""
+        payload = {"reason": reason, "callSid": call_sid}
+        if callback_name or callback_phone:
+            payload["callback"] = {"name": callback_name, "phone": callback_phone}
+        if extra:
+            payload.update(extra)
+        log_event("handoff", callSid=call_sid, reason=reason)
+        await websocket.send_json(
+            {"type": "end", "handoffData": json.dumps(payload)}
+        )
 
     async def send_text_tokens(reply_stream, spoken_box=None) -> str:
         """Stream reply tokens to Twilio with a short holdback, normalizing
@@ -1052,6 +1110,13 @@ async def relay_ws(websocket: WebSocket) -> None:
                 log_event("turn", callSid=call_sid, role="user", text=user_text)
                 history.append({"role": "user", "content": user_text})
 
+                # Caller asked for a person: hand off instead of answering.
+                if HANDOFF_RE.search(user_text):
+                    await do_handoff(
+                        "caller-requested-human", {"lastUtterance": user_text}
+                    )
+                    return
+
                 # Bare-name reply: the assistant just asked for the name and
                 # the caller answered with the name alone ("Jonathan."), or
                 # the caller volunteered a bare first name after a callback
@@ -1192,7 +1257,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 reply = ""
                                 break
                             elif live.get("type") == "dtmf":
-                                log_event("dtmf", callSid=call_sid, digit=live.get("digit"))
+                                digit = live.get("digit")
+                                log_event("dtmf", callSid=call_sid, digit=digit)
+                                if digit == "0":
+                                    await do_handoff("dtmf-0")
+                                    return
                             else:
                                 log_event(
                                     "early_message", callSid=call_sid, type=live.get("type")
@@ -1283,7 +1352,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                 )
 
             elif msg_type == "dtmf":
-                log_event("dtmf", callSid=call_sid, digit=message.get("digit"))
+                digit = message.get("digit")
+                log_event("dtmf", callSid=call_sid, digit=digit)
+                if digit == "0":
+                    await do_handoff("dtmf-0")
+                    return
 
             elif msg_type == "info":
                 log_event(

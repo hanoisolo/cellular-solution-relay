@@ -86,7 +86,7 @@ def main():
     http_paths = {r.path for r in app.routes
                   if hasattr(r, "methods") and r.path not in BUILTIN}
     ws_paths = {r.path for r in app.routes if not hasattr(r, "methods")}
-    check("route inventory", http_paths == {"/", "/health", "/twiml", "/twiml-outbound", "/sms"},
+    check("route inventory", http_paths == {"/", "/health", "/twiml", "/twiml-outbound", "/sms", "/handoff"},
           f"http routes: {sorted(http_paths)}")
     check("websocket inventory", ws_paths == {"/ws"}, f"ws routes: {sorted(ws_paths)}")
 
@@ -125,6 +125,10 @@ def main():
     check("ConversationRelay keeps welcomeGreeting + reconnect",
           cr.get("welcomeGreeting") == WELCOME_GREETING and cr.get("applicationReconnect") == "true",
           f"attrs: {dict(cr.attrib)}")
+    connect_el = ET.fromstring(r.content).find("./Connect")
+    check("Connect action URL points at /handoff (crash/handoff fallback)",
+          (connect_el.get("action") or "").endswith("/handoff"),
+          f"action: {connect_el.get('action')}")
 
     # --- Shared keep-alive Mistral client: one per event loop ---
     c1 = server._mistral_client()
@@ -217,6 +221,19 @@ def main():
     p4["MediaUrl0"] = ""
     check("POST /sms blank param + good signature -> 200",
           post_signed("/sms", p4, "tok-123").status_code == 200)
+
+    # --- /handoff: <Connect> action URL; POST-only, signature-checked, dials store ---
+    check("GET /handoff -> 405", client.get("/handoff").status_code == 405)
+    hp = {"CallSid": "CA123", "HandoffData": '{"reason": "caller-requested-human"}'}
+    check("POST /handoff missing signature -> 403",
+          client.post("/handoff", data=hp).status_code == 403)
+    check("POST /handoff bad signature -> 403",
+          client.post("/handoff", data=hp, headers={"X-Twilio-Signature": "bogus"}).status_code == 403)
+    r = post_signed("/handoff", hp, "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff good signature -> 200 Dial store line",
+          r.status_code == 200 and dial is not None and dial.text == "+19052642228",
+          f"{r.status_code} {r.text[:200]}")
     del os.environ["TWILIO_AUTH_TOKEN"]
 
     # --- send_sms is env-gated: no Twilio env -> None, no network ---
