@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape as _xml_escape
@@ -964,6 +965,9 @@ async def relay_ws(websocket: WebSocket) -> None:
     # Outbound calls: recording notice fires on the first affirmative answer.
     is_outbound = False
     recording_disclosed = False
+    # Turn timing: set when a prompt arrives, read by send_text_tokens and the
+    # reply path to log first_token / turn_done latencies per turn.
+    t_prompt = 0.0
 
     async def do_handoff(reason: str, extra: dict | None = None) -> None:
         """End the relay session; Twilio then POSTs the action URL (/handoff)
@@ -983,7 +987,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         each chunk for TTS before it is spoken; return the full reply text
         (raw, for history/logs).
 
-        The holdback is 40 characters: the website ('cellularsolution.ca',
+        The holdback is 26 characters: the website ('cellularsolution.ca',
         'www.cellularsolution.ca', 'cellular solution dot c a') is at most
         25 characters, so it always fits inside the held-back tail together
         with any comma after it, and _speakable_text rewrites it before
@@ -1001,7 +1005,9 @@ async def relay_ws(websocket: WebSocket) -> None:
         starts ~0.3s after the first tokens arrive instead of after the
         whole reply is generated.
         """
-        HOLD_BACK = 40
+        # 26 chars: the longest spoken site form ("cellular solution dot c a"
+        # + comma) is 26, so it always stays whole in the held-back tail.
+        HOLD_BACK = 26
         full = ""
         pending = ""
         prev_ended_with_site = False
@@ -1080,8 +1086,14 @@ async def relay_ws(websocket: WebSocket) -> None:
                     token = await nxt
             else:
                 token = await _next_token()
+            first_token_ms = None
             while token is not None:
                 if token:
+                    if first_token_ms is None:
+                        first_token_ms = (time.monotonic() - t_prompt) * 1000
+                        log_event(
+                            "first_token", callSid=call_sid, ms=round(first_token_ms, 1)
+                        )
                     full += token
                     pending += token
                     if len(pending) > HOLD_BACK:
@@ -1176,6 +1188,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                 if not user_text:
                     continue
                 log_event("turn", callSid=call_sid, role="user", text=user_text)
+                t_prompt = time.monotonic()
                 history.append({"role": "user", "content": user_text})
 
                 # Caller asked for a person: hand off instead of answering.
@@ -1400,6 +1413,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                     llm_task = None
 
                 if reply:
+                    log_event(
+                        "turn_done",
+                        callSid=call_sid,
+                        ms=round((time.monotonic() - t_prompt) * 1000, 1),
+                        chars=len(reply),
+                    )
                     history.append({"role": "assistant", "content": reply.strip()})
                     if notice_to_log:
                         # The recording notice was spoken before this reply;
