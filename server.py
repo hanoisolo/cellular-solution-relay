@@ -109,7 +109,7 @@ RECORDING_DISCLOSURE = "Just so you know, this call is recorded."
 
 AFFIRMATIVE_RE = re.compile(
     r"\b(yes|yeah|yep|sure|okay|ok|go ahead|absolutely|of course|"
-    r"i have a minute|one minute|just a minute|a minute)\b",
+    r"i have a minute|one minute|just a minute|a minute|i do)\b",
     re.IGNORECASE,
 )
 NEGATIVE_RE = re.compile(
@@ -606,7 +606,14 @@ async def mistral_stream_reply(
     async with client.stream(
         "POST", MISTRAL_URL, json=payload, headers=headers
     ) as response:
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Log the provider's own error body (model retired, bad param, ...)
+            # so a 400 is diagnosable from the relay logs alone.
+            body = (await response.aread()).decode("utf-8", "replace")
+            raise RuntimeError(
+                f"Mistral HTTP {response.status_code} for model {MISTRAL_MODEL!r}: "
+                f"{body[:400]}"
+            )
         async for line in response.aiter_lines():
             if not line.startswith("data:"):
                 continue
@@ -648,7 +655,11 @@ async def mistral_sms_reply(history: list[dict]) -> str:
     }
     client = _mistral_client()
     response = await client.post(MISTRAL_URL, json=payload, headers=headers, timeout=30.0)
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Mistral HTTP {response.status_code} for model {MISTRAL_MODEL!r}: "
+            f"{response.text[:400]}"
+        )
     chunk = response.json()
     return _content_to_text(
         chunk.get("choices", [{}])[0].get("message", {}).get("content")
