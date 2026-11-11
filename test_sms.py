@@ -183,6 +183,18 @@ def main():
           client.post("/twiml-outbound", data=p2, headers={"X-Twilio-Signature": "bogus"}).status_code == 403)
     check("POST /twiml-outbound good signature -> 200",
           post_signed("/twiml-outbound", p2, "tok-123").status_code == 200)
+    # Regression: Twilio signs blank-valued POST params too (e.g. ForwardedFrom=);
+    # dropping them server-side must not reject a legitimately signed request.
+    p3 = dict(p2)
+    p3["ForwardedFrom"] = ""
+    check("POST /twiml blank param + good signature -> 200",
+          post_signed("/twiml", p3, "tok-123").status_code == 200)
+    check("POST /twiml-outbound blank param + good signature -> 200",
+          post_signed("/twiml-outbound", p3, "tok-123").status_code == 200)
+    p4 = sms_params("hello with blank")
+    p4["MediaUrl0"] = ""
+    check("POST /sms blank param + good signature -> 200",
+          post_signed("/sms", p4, "tok-123").status_code == 200)
     del os.environ["TWILIO_AUTH_TOKEN"]
 
     # --- send_sms is env-gated: no Twilio env -> None, no network ---

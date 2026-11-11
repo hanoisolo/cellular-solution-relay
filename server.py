@@ -587,7 +587,10 @@ async def _twiml_response(request: Request, greeting: str) -> Response:
     token = _twilio_auth_token()
     if request.method == "POST" and token:
         body = await request.body()
-        params = dict(parse_qsl(body.decode("utf-8", "replace")))
+        # keep_blank_values: Twilio signs every POST param it sends, INCLUDING
+        # empty-valued ones (e.g. ForwardedFrom=). Dropping blanks here would
+        # change the signed data string and reject legitimate Twilio requests.
+        params = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
         signature = request.headers.get("x-twilio-signature", "")
         url = public_http_url(request)
         if not signature or not twilio_signature_valid(
