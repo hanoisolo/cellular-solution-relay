@@ -98,7 +98,7 @@ OUTBOUND_GREETING = (
 # with RELAY_DISCLOSURE.
 DISCLOSURE = (
     "You are speaking with Cellular Solution's automated AI assistant, "
-    "and this call is recorded."
+    "and this call is being recorded for quality assurance."
 )
 
 # On OUTBOUND calls the greeting already identifies the AI assistant, so the
@@ -106,7 +106,9 @@ DISCLOSURE = (
 # greeting's "do you have a minute?" (owner decision, 2026-11-11), as a
 # non-interruptible token. Inbound calls get the full DISCLOSURE at setup.
 # Runtime-overridable with RELAY_RECORDING_DISCLOSURE.
-RECORDING_DISCLOSURE = "Just so you know, this call is recorded."
+RECORDING_DISCLOSURE = (
+    "Just so you know, this call is being recorded for quality assurance."
+)
 
 AFFIRMATIVE_RE = re.compile(
     r"\b(yes|yeah|yep|sure|okay|ok|go ahead|absolutely|of course|"

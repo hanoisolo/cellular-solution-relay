@@ -47,6 +47,8 @@ from server import (  # noqa: E402
     OUTBOUND_SYSTEM_PROMPT,
     WELCOME_GREETING,
     OUTBOUND_GREETING,
+    DISCLOSURE,
+    RECORDING_DISCLOSURE,
 )
 
 client = TestClient(app)
@@ -262,6 +264,18 @@ def main():
         check(f"{name} prompt: never deny EPP / no fake department",
               "never say we do not have EPP" in prompt and "no separate department" in prompt,
               f"guardrail missing from {name} prompt")
+
+    # --- Disclosures must say the call is recorded for quality assurance ---
+    check("inbound disclosure: AI + recorded for quality assurance",
+          "ai assistant" in DISCLOSURE.lower() and "being recorded for quality assurance" in DISCLOSURE.lower(),
+          f"DISCLOSURE: {DISCLOSURE!r}")
+    check("outbound recording notice: recorded for quality assurance",
+          "being recorded for quality assurance" in RECORDING_DISCLOSURE.lower(),
+          f"RECORDING_DISCLOSURE: {RECORDING_DISCLOSURE!r}")
+    check("no birthday/Phil leftovers in compiled greetings or disclosures",
+          all("birthday" not in t.lower() and "phil" not in t.lower()
+              for t in (WELCOME_GREETING, OUTBOUND_GREETING, DISCLOSURE, RECORDING_DISCLOSURE)),
+          "found birthday/Phil wording")
 
     print(f"\nALL {len(PASSED)} TESTS PASSED")
 
