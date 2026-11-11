@@ -6,3 +6,7 @@ __pycache__/
 !.env.example
 *.log
 *.xml
+.vibe/
+node_modules/
+*.pem
+*.key
