@@ -18,9 +18,10 @@ Caller -> Twilio number -> POST /twiml (this server)
 
 | File | What it is |
 | --- | --- |
-| `server.py` | FastAPI app: `GET /`, `GET /health`, `POST /twiml`, `WS /ws` |
+| `server.py` | FastAPI app: `GET /`, `GET /health`, `GET|POST /twiml`, `GET|POST /twiml-outbound`, `POST /sms`, `WS /ws` |
 | `requirements.txt` | Pinned dependencies (verified on Python 3.12) |
 | `test_ws.py` | Local WebSocket test (fake setup + prompt, no Twilio/Mistral) |
+| `test_sms.py` | Headless route & contract parity tests (in-process TestClient, no port) |
 | `.gitignore` | Excludes `.venv/` and `.env` — never commit secrets |
 
 ## Run locally
@@ -40,7 +41,8 @@ MISTRAL_API_KEY=<your key> .venv/bin/python server.py
 Server listens on `PORT` (default 8000). Then, in another terminal:
 
 ```bash
-.venv/bin/python test_ws.py
+.venv/bin/python test_ws.py          # WS flow against the MOCK_LLM server
+MOCK_LLM=1 .venv/bin/python test_sms.py   # HTTP route-parity suite, no server needed
 ```
 
 `test_ws.py` opens a WebSocket, sends a fake `setup` + `prompt` (a callback
@@ -48,6 +50,12 @@ request with a name and phone number), prints every message the server
 returns, and asserts a `text` token with `last=true` arrives. It also
 exercises the interrupt path and checks the Twilio signature validator
 against an independently computed HMAC.
+
+`test_sms.py` uses FastAPI's in-process `TestClient` (no port, no network)
+and asserts route & contract parity for every registered route: status
+codes, response shapes, 405 on wrong methods, 403 on missing/bad Twilio
+signatures, the `/sms` `<Message>` reply, XML escaping, and per-sender SMS
+history.
 
 Check the TwiML endpoint too:
 
@@ -64,8 +72,13 @@ curl -s http://localhost:8000/health
 | `MISTRAL_MODEL` | No | Default `mistral-large-4`. |
 | `PORT` | No | Railway sets this automatically. Default `8000` locally. |
 | `RELAY_WS_URL` | No | Public `wss://` URL of this server. If unset, `/twiml` builds `wss://<request host>/ws`. Set it explicitly on Railway. |
-| `TWILIO_AUTH_TOKEN` | No, but **set it in production** | Enables `X-Twilio-Signature` validation on `/twiml` (POST) and the `/ws` handshake. Without it the server logs a warning and validation is off. |
+| `TWILIO_AUTH_TOKEN` | No, but **set it in production** | Enables `X-Twilio-Signature` validation on `/twiml`, `/twiml-outbound`, `/sms` (POST) and the `/ws` handshake. Without it the server logs a warning and validation is off. Read per request. |
 | `MOCK_LLM` | No | `1` = answer with canned replies, no Mistral call. For testing only. |
+| `RELAY_SMS_SYSTEM_PROMPT` | No | SMS system prompt sent to Mistral for `POST /sms`. Default `SMS_SYSTEM_PROMPT`. |
+| `TWILIO_ACCOUNT_SID` | Only for outbound SMS | Account SID used by `send_sms()` (callback alerts). |
+| `TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET` | Alt to auth token | API-key Basic auth for `send_sms()` (takes precedence over `TWILIO_AUTH_TOKEN`). |
+| `TWILIO_FROM` | Only for outbound SMS | Sender number for `send_sms()` (e.g. +14374754742). |
+| `STORE_SMS_NUMBER` | No | When set, every captured `CALLBACK_REQUEST` also texts the store: "Callback request: name phone (call sid)". Unset = logs-only, as before. |
 | `RELAY_LANGUAGE` | No | Default `en-CA`. TTS/STT language. |
 | `RELAY_TTS_PROVIDER` | No | Default `Google`. |
 | `RELAY_TTS_VOICE` | No | Default `en-CA-Standard-A`. |
@@ -85,8 +98,26 @@ curl -s http://localhost:8000/health
 - Replies are short (1–3 sentences), plain spoken language, no markdown.
 - Every call turn is logged to stdout as one JSON line. When a callback is
   captured, a structured `CALLBACK_REQUEST` line is logged with `callSid`,
-  `name`, `phone`, `timestamp`. V1 does **not** send email — someone has to
-  read the logs (or the next version wires up a notification).
+  `name`, `phone`, `timestamp`; if `STORE_SMS_NUMBER` is set, the store also
+  gets an SMS at that moment.
+
+## How an SMS flows
+
+```
+Texter -> +1 437 475 4742 -> POST /sms (this server, signature-checked)
+  -> Mistral (SMS_SYSTEM_PROMPT, per-sender history) -> <Response><Message>
+```
+
+- Replies are plain text: the website stays `cellularsolution.ca` verbatim
+  (the voice-only "dot c a" rewrite in `_speakable_text` is never applied
+  to SMS). Replies are 1–3 sentences, no markdown.
+- Per-sender history is kept in memory (`SMS_SESSIONS`, capped) so follow-up
+  texts have context; it resets on redeploy.
+- Outbound SMS from the agent is env-gated (`send_sms`): used for the
+  callback alert above. For ad-hoc sends use `demo/sms_tool.py send`.
+- Compliance note: a Canadian +1 local number texting Canadian numbers does
+  not need A2P/10DLC registration. Texting **US** numbers as A2P does — register
+  the brand/campaign first if that is ever needed.
 
 ## Deploy to Railway (dashboard steps — do these by hand)
 
@@ -119,7 +150,11 @@ dashboard job:
    handler from the Welcome TwiML Bin to **Webhook**,
    `https://<your Railway public domain>/twiml`, HTTP POST. The fixed
    menu bins stay untouched, so you can switch back any time.
-8. Test: call +1 437 475 4742 from your mobile and talk to Mistral.
+   Do the same for **Messaging Configuration**: A MESSAGE COMES IN →
+   Webhook `https://<your Railway public domain>/sms`, HTTP POST
+   (or run `python demo/sms_tool.py configure` from the demo kit).
+8. Test: call +1 437 475 4742 from your mobile and talk to Mistral;
+   text the same number and get an AI SMS reply.
 
 ## Costs (per minute, roughly)
 
@@ -149,7 +184,8 @@ dashboard job:
 
 ## What this is not (yet)
 
-- No email/SMS on callback capture (logs only).
+- No email on callback capture (SMS alert only, if `STORE_SMS_NUMBER` is set;
+  otherwise logs only).
 - No transfer to a human (no `<Dial>` handoff yet — the `end` message with
   `handoffData` is supported by the protocol but not wired to a transfer).
 - No Net2Phone integration (paused at the user's request).
@@ -166,6 +202,7 @@ redeploy — no code edit needed):
 | `RELAY_OUTBOUND_GREETING` | outbound `welcomeGreeting` (`/twiml-outbound`) | `OUTBOUND_GREETING` |
 | `RELAY_SYSTEM_PROMPT` | inbound system prompt sent to Mistral | `SYSTEM_PROMPT` |
 | `RELAY_OUTBOUND_SYSTEM_PROMPT` | outbound system prompt (ws setup `direction` starts with "outbound") | `OUTBOUND_SYSTEM_PROMPT` |
+| `RELAY_SMS_SYSTEM_PROMPT` | SMS system prompt (`POST /sms`) | `SMS_SYSTEM_PROMPT` |
 | `RELAY_HINTS` | ConversationRelay `hints` attribute (both legs) | `DEFAULT_HINTS` |
 
 Set them in the Railway dashboard (service → Variables) or via the API
