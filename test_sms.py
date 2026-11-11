@@ -43,6 +43,8 @@ from server import (  # noqa: E402
     send_sms,
     SMS_SYSTEM_PROMPT,
     SMS_SESSIONS,
+    SYSTEM_PROMPT,
+    OUTBOUND_SYSTEM_PROMPT,
     WELCOME_GREETING,
     OUTBOUND_GREETING,
 )
@@ -200,6 +202,16 @@ def main():
     # --- send_sms is env-gated: no Twilio env -> None, no network ---
     result = asyncio.run(send_sms("+14165550199", "test"))
     check("send_sms without env returns None", result is None, f"got {result!r}")
+
+    # --- Prompt guardrails: the agent must never imply EPP does not exist ---
+    # (regression: an inbound caller asking for the "EPP department" got
+    # "we don't have a separate EPP department" — reads as denying EPP)
+    for name, prompt in (("inbound", SYSTEM_PROMPT),
+                         ("outbound", OUTBOUND_SYSTEM_PROMPT),
+                         ("sms", SMS_SYSTEM_PROMPT)):
+        check(f"{name} prompt: never deny EPP / no fake department",
+              "never say we do not have EPP" in prompt and "no separate department" in prompt,
+              f"guardrail missing from {name} prompt")
 
     print(f"\nALL {len(PASSED)} TESTS PASSED")
 
