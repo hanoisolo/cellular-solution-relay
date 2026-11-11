@@ -83,6 +83,18 @@ curl -s http://localhost:8000/health
 | `RELAY_TTS_PROVIDER` | No | Default `Google`. |
 | `RELAY_TTS_VOICE` | No | Default `en-CA-Standard-A`. |
 | `RELAY_STT_PROVIDER` | No | Default `Google`, `speechModel=telephony`. |
+| `RELAY_SYSTEM_PROMPT` | No | Inbound voice system prompt sent to Mistral. Default `SYSTEM_PROMPT`. |
+| `RELAY_OUTBOUND_SYSTEM_PROMPT` | No | Outbound voice system prompt. Default `OUTBOUND_SYSTEM_PROMPT`. |
+| `RELAY_WELCOME_GREETING` | No | Greeting spoken as a non-interruptible token on inbound setup. Default `WELCOME_GREETING`. |
+| `RELAY_OUTBOUND_GREETING` | No | Greeting spoken on outbound setup. Default `OUTBOUND_GREETING`. |
+| `RELAY_DISCLOSURE` | No | Inbound AI + recording disclosure token. Default `DISCLOSURE`. |
+| `RELAY_RECORDING_DISCLOSURE` | No | Outbound recording notice (spoken after a positive answer to the greeting). Default `RECORDING_DISCLOSURE`. |
+| `RELAY_HINTS` | No | ConversationRelay STT `hints` attribute. Default `DEFAULT_HINTS`. |
+| `RELAY_NUDGE_AFTER` | No | Seconds of LLM silence before the silence nudge fires. Default `3`. |
+| `RELAY_NUDGE_TEXT` | No | Silence nudge text. Default `"One moment, ..."`. |
+| `RELAY_STORE_NUMBER` | No | Store number dialed by `/handoff`. Default `+19052642228`. |
+| `RELAY_EPP_HARDWARE_OFFERS` | No | Verified Bell EPP hardware offers block appended to every system prompt (see "EPP offers blocks" below). Default empty = no block. |
+| `RELAY_EPP_PLAN_OFFERS` | No | Verified Bell EPP rate plan offers block, same mechanism. Default empty; set when the rate plan grid is loaded. |
 
 ## Behaviour (baked into the system prompt in `server.py`)
 
@@ -192,9 +204,9 @@ dashboard job:
 
 ## Changing the agent's wording without touching code
 
-All spoken/prompt wording is overridable via environment variables (read per
-request, so set them on Railway and the change applies on the next request or
-redeploy — no code edit needed):
+All runtime-tunable wording and relay settings are overridable via environment
+variables (read per request, so set them on Railway and the change applies on
+the next request or redeploy — no code edit needed):
 
 | Env var | Overrides | Default |
 | --- | --- | --- |
@@ -204,8 +216,47 @@ redeploy — no code edit needed):
 | `RELAY_OUTBOUND_SYSTEM_PROMPT` | outbound system prompt (ws setup `direction` starts with "outbound") | `OUTBOUND_SYSTEM_PROMPT` |
 | `RELAY_SMS_SYSTEM_PROMPT` | SMS system prompt (`POST /sms`) | `SMS_SYSTEM_PROMPT` |
 | `RELAY_HINTS` | ConversationRelay `hints` attribute (both legs) | `DEFAULT_HINTS` |
+| `RELAY_DISCLOSURE` | inbound AI + recording disclosure token | `DISCLOSURE` |
+| `RELAY_RECORDING_DISCLOSURE` | outbound recording notice token | `RECORDING_DISCLOSURE` |
+| `RELAY_NUDGE_AFTER` | silence-nudge delay (seconds) | `3` |
+| `RELAY_NUDGE_TEXT` | silence-nudge text | `"One moment, ..."` |
+| `RELAY_STORE_NUMBER` | `/handoff` dial target | `+19052642228` |
+| `RELAY_WS_URL` | public `wss://` URL written into `/twiml` | derived from request host |
+| `RELAY_LANGUAGE` | STT/TTS language | `en-CA` |
+| `RELAY_TTS_PROVIDER` | TTS provider | `Google` |
+| `RELAY_TTS_VOICE` | TTS voice | `en-CA-Standard-A` |
+| `RELAY_STT_PROVIDER` | STT provider / speech model | `Google`, telephony |
+| `RELAY_EPP_HARDWARE_OFFERS` | appended verified hardware offers block (all prompts) | empty = no block |
+| `RELAY_EPP_PLAN_OFFERS` | appended verified rate plan offers block (all prompts) | empty = no block |
 
 Set them in the Railway dashboard (service → Variables) or via the API
 (`variableUpsert`). Empty/unset falls back to the compiled-in default, so the
 defaults above are always a safe rollback. Attribute values are XML-escaped
 (`escape_attr`) before being written into the TwiML.
+
+## EPP offers blocks (hardware & rate plans)
+
+Two independent, optional env vars inject **verified, quotable Bell EPP
+pricing** into every system prompt (inbound voice, outbound voice, and SMS —
+at session start and re-read on every turn, so a Railway var change applies
+live):
+
+| Env var | Contents | Default |
+| --- | --- | --- |
+| `RELAY_EPP_HARDWARE_OFFERS` | Hardware offers payload from `demo/epp_grid.py --kind hardware` | empty = no block |
+| `RELAY_EPP_PLAN_OFFERS` | Rate plan offers payload from `--kind plans` (not loaded yet) | empty = no block |
+
+- When a block is set, `with_offers()` appends it after the base prompt
+  together with `EPP_OFFERS_GUARDRAIL`: the agent may quote ONLY what is in
+  the block, with its `as of YYYY-MM-DD` date; it must never compute,
+  estimate, or apply discounts, and never invent a price, plan, or device;
+  anything unlisted goes to the store ("the store will confirm it").
+- Payloads are generated from the Bell grid CSVs by `demo/epp_grid.py` (see
+  `demo/README.md`). When Bell issues a new grid, re-run the tool and
+  re-upsert the var — the owner owns that duty.
+- Rollback is instant: delete or clear the var and prompts return to the
+  compiled defaults on the next request.
+- Confidentiality: the real Bell grids are dealer-confidential. Keep them
+  local in `demo/` (untracked); never commit them to this public repo and
+  never paste them into chat or logs. `demo/epp_grid.example.csv` is
+  synthetic.

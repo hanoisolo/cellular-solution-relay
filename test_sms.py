@@ -334,6 +334,28 @@ def main():
     check("sms system prompt: unset vars restore base prompt (clean rollback)",
           hist[0]["content"] == SMS_SYSTEM_PROMPT and "VERIFIED OFFERS" not in hist[0]["content"])
 
+    # --- Env-key parity (anti-drift): every RELAY_* var used in server.py must
+    # be documented as a table row in BOTH README env tables ---
+    import re as _re
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "server.py"), encoding="utf-8") as f:
+        src = f.read()
+    with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
+        readme = f.read()
+    code_vars = sorted(set(_re.findall(r"RELAY_[A-Z0-9_]+", src)))
+    row_counts = {}
+    for ln in readme.splitlines():
+        m = _re.match(r"\| `(RELAY_[A-Z0-9_]+)`", ln)
+        if m:
+            row_counts[m.group(1)] = row_counts.get(m.group(1), 0) + 1
+    missing = [v for v in code_vars if row_counts.get(v, 0) < 2]
+    check("env-key parity: every RELAY_* var in server.py appears in both README tables",
+          not missing,
+          f"missing/once-only: {missing}; code vars: {code_vars}")
+    check("env-key parity: EPP offers vars documented in both tables",
+          row_counts.get("RELAY_EPP_HARDWARE_OFFERS", 0) >= 2
+          and row_counts.get("RELAY_EPP_PLAN_OFFERS", 0) >= 2)
+
     print(f"\nALL {len(PASSED)} TESTS PASSED")
 
 
