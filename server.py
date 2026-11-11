@@ -60,7 +60,13 @@ RELAY_TTS_PROVIDER = os.environ.get("RELAY_TTS_PROVIDER", "")
 RELAY_TTS_VOICE = os.environ.get("RELAY_TTS_VOICE", "")
 RELAY_STT_PROVIDER = os.environ.get("RELAY_STT_PROVIDER", "Google")
 
-DEFAULT_HINTS = "Bell, EPP, Employee Purchase Program, mobility, callback"
+# Speech-recognition hints: words the recognizer should expect on this line
+# of business. Overridable at runtime with RELAY_HINTS (Railway var).
+DEFAULT_HINTS = (
+    "Bell, Rogers, Telus, Koodo, Fido, Virgin, Freedom, eSIM, EID, IMEI, "
+    "EPP, Employee Purchase Program, mobility, plans, promotions, autopay, "
+    "port-in, callback, 905-264-2228"
+)
 
 
 def _env_or(name: str, default: str) -> str:
@@ -262,6 +268,30 @@ def _mock_reply_for(history: list[dict]) -> str:
 # reconnect (applicationReconnect=true) and pick up where it left off.
 SESSIONS: dict[str, list[dict]] = {}
 MAX_SESSIONS = 100
+# Voice history per call keeps only the system prompt plus the most recent
+# turns, so each Mistral request stays small and fast on long calls.
+MAX_HISTORY_MESSAGES = 20
+
+# One keep-alive HTTP client per event loop, reused across turns: reconnecting
+# to Mistral (hosted in the EU) on every reply would add a full TLS round trip
+# to every turn. Keyed by running loop so in-process tests (TestClient's anyio
+# portal) never share a client across loops.
+_MISTRAL_CLIENTS: dict[int, "httpx.AsyncClient"] = {}
+
+
+def _mistral_client() -> "httpx.AsyncClient":
+    try:
+        key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        key = 0
+    client = _MISTRAL_CLIENTS.get(key)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=60.0,
+            limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=30.0),
+        )
+        _MISTRAL_CLIENTS[key] = client
+    return client
 
 # In-memory SMS history per sender (From number), capped like SESSIONS.
 SMS_SESSIONS: dict[str, list[dict]] = {}
@@ -491,12 +521,13 @@ async def mistral_stream_reply(
     payload = {
         "model": MISTRAL_MODEL,
         "messages": history,
-        "temperature": 0.5,
-        # mistral-small-latest does not emit "thinking" blocks, so 300 tokens
-        # of plain text is plenty for a 1-3 sentence spoken reply.
-        # (mistral-large-4 needed 1000+ because its thinking alone could eat
-        # the whole budget before any answer text appeared.)
-        "max_tokens": 300,
+        # Low temperature: prices and disclosures must come out identical on
+        # every call, not creatively reworded.
+        "temperature": 0.3,
+        # 200 tokens covers a 1-3 sentence spoken reply (mistral-small emits
+        # no "thinking" blocks; mistral-large-4 needed 1000+ because its
+        # thinking alone could eat the whole budget before any answer text).
+        "max_tokens": 200,
         "stream": True,
     }
     headers = {
@@ -504,25 +535,25 @@ async def mistral_stream_reply(
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream(
-            "POST", MISTRAL_URL, json=payload, headers=headers
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                text = _content_to_text(delta.get("content"))
-                if text:
-                    yield text
+    client = _mistral_client()
+    async with client.stream(
+        "POST", MISTRAL_URL, json=payload, headers=headers
+    ) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            text = _content_to_text(delta.get("content"))
+            if text:
+                yield text
 
 
 async def mistral_sms_reply(history: list[dict]) -> str:
@@ -548,13 +579,13 @@ async def mistral_sms_reply(history: list[dict]) -> str:
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(MISTRAL_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        chunk = response.json()
-        return _content_to_text(
-            chunk.get("choices", [{}])[0].get("message", {}).get("content")
-        )
+    client = _mistral_client()
+    response = await client.post(MISTRAL_URL, json=payload, headers=headers, timeout=30.0)
+    response.raise_for_status()
+    chunk = response.json()
+    return _content_to_text(
+        chunk.get("choices", [{}])[0].get("message", {}).get("content")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +622,10 @@ def conversation_relay_xml(ws_url: str, greeting: str) -> str:
         f'transcriptionProvider="{RELAY_STT_PROVIDER}" '
         'speechModel="telephony" '
         'interruptible="any" '
+        # "uh-huh"/"yeah" must not cut the agent off mid-sentence.
+        'ignoreBackchannel="true" '
+        # Keypad entry (PINs, "press 0 for a person") arrives as dtmf messages.
+        'dtmfDetection="true" '
         'applicationReconnect="true" '
         f'hints="{escape_attr(_env_or("RELAY_HINTS", DEFAULT_HINTS))}" />'
         "</Connect></Response>"
@@ -847,15 +882,51 @@ async def relay_ws(websocket: WebSocket) -> None:
                     }
                 )
 
+        # Silence nudge: if Mistral takes longer than RELAY_NUDGE_AFTER
+        # seconds (default 3) to produce its first token, speak a short
+        # "One moment..." line so the caller does not hear dead air.
+        # The nudge is NOT part of `full`, so it never enters history.
+        nudge_after = float(os.environ.get("RELAY_NUDGE_AFTER", "3") or 0)
+        nudge_text = os.environ.get("RELAY_NUDGE_TEXT", "") or "One moment, "
+
+        async def _next_token():
+            try:
+                return await it.__anext__()
+            except StopAsyncIteration:
+                return None
+
+        it = reply_stream.__aiter__()
         try:
-            async for token in reply_stream:
-                if not token:
-                    continue
-                full += token
-                pending += token
-                if len(pending) > HOLD_BACK:
-                    emit, pending = _split_pending(pending)
-                    await _flush(emit)
+            if nudge_after > 0:
+                # shield() keeps the pending __anext__ alive across the
+                # timeout — cancelling it would kill the stream generator.
+                nxt = asyncio.ensure_future(_next_token())
+                try:
+                    token = await asyncio.wait_for(
+                        asyncio.shield(nxt), timeout=nudge_after
+                    )
+                except asyncio.TimeoutError:
+                    log_event("nudge_sent", callSid=call_sid)
+                    await websocket.send_json(
+                        {
+                            "type": "text",
+                            "token": nudge_text,
+                            "last": False,
+                            "interruptible": True,
+                            "preemptible": False,
+                        }
+                    )
+                    token = await nxt
+            else:
+                token = await _next_token()
+            while token is not None:
+                if token:
+                    full += token
+                    pending += token
+                    if len(pending) > HOLD_BACK:
+                        emit, pending = _split_pending(pending)
+                        await _flush(emit)
+                token = await _next_token()
         except asyncio.CancelledError:
             raise
         await _flush(pending)
@@ -1053,6 +1124,9 @@ async def relay_ws(websocket: WebSocket) -> None:
 
                 if reply:
                     history.append({"role": "assistant", "content": reply.strip()})
+                    # Keep only the system prompt plus the most recent turns.
+                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                        del history[1]
                     log_event(
                         "turn", callSid=call_sid, role="assistant", text=reply.strip()
                     )

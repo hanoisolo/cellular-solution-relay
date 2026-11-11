@@ -112,6 +112,26 @@ def main():
           and cr.get("welcomeGreeting") == OUTBOUND_GREETING,
           f"{r.status_code} {r.text[:200]}")
 
+    # --- ConversationRelay hardening attributes (2026-11-11 tips pass) ---
+    r = client.get("/twiml")
+    cr = ET.fromstring(r.content).find("./Connect/ConversationRelay")
+    check("ConversationRelay ignoreBackchannel + dtmfDetection enabled",
+          cr.get("ignoreBackchannel") == "true" and cr.get("dtmfDetection") == "true",
+          f"attrs: {dict(cr.attrib)}")
+    check("ConversationRelay hints cover carriers + device IDs + store number",
+          all(w in (cr.get("hints") or "")
+              for w in ("Bell", "Rogers", "Telus", "eSIM", "EID", "IMEI", "EPP", "905-264-2228")),
+          f"hints: {cr.get('hints')}")
+    check("ConversationRelay keeps welcomeGreeting + reconnect",
+          cr.get("welcomeGreeting") == WELCOME_GREETING and cr.get("applicationReconnect") == "true",
+          f"attrs: {dict(cr.attrib)}")
+
+    # --- Shared keep-alive Mistral client: one per event loop ---
+    c1 = server._mistral_client()
+    c2 = server._mistral_client()
+    check("mistral httpx client reused within a loop", c1 is c2 and not c1.is_closed,
+          f"c1 is c2: {c1 is c2}, closed: {c1.is_closed}")
+
     # --- /sms: POST only, TwiML <Message> with the mock reply ---
     check("GET /sms -> 405", client.get("/sms").status_code == 405)
 
