@@ -29,7 +29,8 @@ os.environ.pop("TWILIO_AUTH_TOKEN", None)
 for _k in ("TWILIO_ACCOUNT_SID", "TWILIO_FROM", "TWILIO_API_KEY_SID",
            "TWILIO_API_KEY_SECRET", "STORE_SMS_NUMBER",
            "RELAY_SMS_SYSTEM_PROMPT", "RELAY_WELCOME_GREETING",
-           "RELAY_OUTBOUND_GREETING"):
+           "RELAY_OUTBOUND_GREETING",
+           "RELAY_EPP_HARDWARE_OFFERS", "RELAY_EPP_PLAN_OFFERS"):
     os.environ.pop(_k, None)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -280,6 +281,58 @@ def main():
           all("birthday" not in t.lower() and "phil" not in t.lower()
               for t in (WELCOME_GREETING, OUTBOUND_GREETING, DISCLOSURE, RECORDING_DISCLOSURE)),
           "found birthday/Phil wording")
+
+    # --- EPP offers blocks: env-gated injection into the SMS system prompt ---
+    check("with_offers: both vars unset -> base unchanged",
+          server.with_offers(SMS_SYSTEM_PROMPT) == SMS_SYSTEM_PROMPT)
+    SMS_SESSIONS.clear()
+    epp_from = "+14165550777"
+    client.post("/sms", data=sms_params("Hi", from_=epp_from))
+    hist = SMS_SESSIONS[epp_from]
+    check("sms system prompt: no offers marker when vars unset",
+          hist[0]["content"] == SMS_SYSTEM_PROMPT and "VERIFIED OFFERS" not in hist[0]["content"],
+          f"content[:80]={hist[0]['content'][:80]!r}")
+
+    hw_on = ("HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+             "Ahlo 1 128GB SmartPay Ultra: $1.13/mo with tax")
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = hw_on
+    client.post("/sms", data=sms_params("price of the Ahlo?", from_=epp_from))
+    hist = SMS_SESSIONS[epp_from]
+    check("sms system prompt: hardware block injected verbatim on per-turn re-read",
+          SMS_SYSTEM_PROMPT in hist[0]["content"]
+          and server.EPP_OFFERS_GUARDRAIL in hist[0]["content"]
+          and f"VERIFIED HARDWARE OFFERS:\n{hw_on}" in hist[0]["content"]
+          and "VERIFIED RATE PLAN OFFERS" not in hist[0]["content"],
+          f"content tail: {hist[0]['content'][-160:]!r}")
+
+    hw_qc = ("HARDWARE OFFERS (Bell EPP, as of 2026-11-11) — Quebec (QC): "
+             "Ahlo 1 128GB SmartPay Ultra: $0.95/mo with tax")
+    pl_on = ("RATE PLAN OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+             "Essential 50GB: $45.00/mo")
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = hw_qc
+    os.environ["RELAY_EPP_PLAN_OFFERS"] = pl_on
+    out = server.with_offers(SMS_SYSTEM_PROMPT)
+    check("with_offers: both set -> base + guardrail + both blocks verbatim",
+          SMS_SYSTEM_PROMPT in out and server.EPP_OFFERS_GUARDRAIL in out
+          and f"VERIFIED HARDWARE OFFERS:\n{hw_qc}" in out
+          and f"VERIFIED RATE PLAN OFFERS:\n{pl_on}" in out)
+    client.post("/sms", data=sms_params("and plans?", from_=epp_from))
+    hist = SMS_SESSIONS[epp_from]
+    check("sms system prompt: both blocks live-updated in place",
+          f"VERIFIED HARDWARE OFFERS:\n{hw_qc}" in hist[0]["content"]
+          and f"VERIFIED RATE PLAN OFFERS:\n{pl_on}" in hist[0]["content"])
+
+    os.environ["RELAY_EPP_PLAN_OFFERS"] = "   "
+    out = server.with_offers(SMS_SYSTEM_PROMPT)
+    check("with_offers: whitespace-only plans var treated as unset",
+          "VERIFIED RATE PLAN OFFERS" not in out and f"VERIFIED HARDWARE OFFERS:\n{hw_qc}" in out)
+
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    os.environ.pop("RELAY_EPP_PLAN_OFFERS", None)
+    client.post("/sms", data=sms_params("ok thanks", from_=epp_from))
+    hist = SMS_SESSIONS[epp_from]
+    check("sms system prompt: unset vars restore base prompt (clean rollback)",
+          hist[0]["content"] == SMS_SYSTEM_PROMPT and "VERIFIED OFFERS" not in hist[0]["content"])
 
     print(f"\nALL {len(PASSED)} TESTS PASSED")
 

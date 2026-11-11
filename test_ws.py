@@ -138,6 +138,87 @@ def check_signature_validator():
     print("SIGNATURE CHECKS: pass")
 
 
+def check_epp_offers_ws():
+    """EPP offers blocks: with_offers() unit checks plus WS setup injection for
+    inbound and outbound directions, via an in-process TestClient websocket.
+    Only `setup` is sent, so no LLM call happens and no live server is needed."""
+    import time
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import server as srv
+    from fastapi.testclient import TestClient
+
+    keys = ("RELAY_EPP_HARDWARE_OFFERS", "RELAY_EPP_PLAN_OFFERS")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert srv.with_offers(srv.SYSTEM_PROMPT) == srv.SYSTEM_PROMPT, (
+            "unset vars must leave the base prompt unchanged"
+        )
+        hw = ("HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+              "Ahlo 1 128GB SmartPay Ultra: $1.13/mo with tax")
+        pl = ("RATE PLAN OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+              "Essential 50GB: $45.00/mo")
+        os.environ["RELAY_EPP_HARDWARE_OFFERS"] = hw
+        out = srv.with_offers(srv.SYSTEM_PROMPT)
+        assert srv.SYSTEM_PROMPT in out and srv.EPP_OFFERS_GUARDRAIL in out
+        assert f"VERIFIED HARDWARE OFFERS:\n{hw}" in out
+        assert "VERIFIED RATE PLAN OFFERS" not in out
+        os.environ["RELAY_EPP_PLAN_OFFERS"] = pl
+        out = srv.with_offers(srv.OUTBOUND_SYSTEM_PROMPT)
+        assert srv.OUTBOUND_SYSTEM_PROMPT in out and srv.EPP_OFFERS_GUARDRAIL in out
+        assert f"VERIFIED HARDWARE OFFERS:\n{hw}" in out
+        assert f"VERIFIED RATE PLAN OFFERS:\n{pl}" in out
+
+        tc = TestClient(srv.app)
+        srv.SESSIONS.clear()
+
+        def ws_setup_and_check(call_sid, direction, expect_prompt):
+            setup = dict(SETUP)
+            setup["callSid"] = call_sid
+            setup["direction"] = direction
+            with tc.websocket_connect("/ws") as ws:
+                ws.send_json(setup)
+                for _ in range(100):
+                    if call_sid in srv.SESSIONS:
+                        break
+                    time.sleep(0.05)
+            assert call_sid in srv.SESSIONS, f"session not created for {call_sid}"
+            assert srv.SESSIONS[call_sid][0]["role"] == "system"
+            content = srv.SESSIONS[call_sid][0]["content"]
+            assert expect_prompt in content, f"base prompt missing for {direction}"
+            assert srv.EPP_OFFERS_GUARDRAIL in content
+            assert f"VERIFIED HARDWARE OFFERS:\n{hw}" in content
+            assert f"VERIFIED RATE PLAN OFFERS:\n{pl}" in content
+
+        ws_setup_and_check("CAepp000000000000000000000000001", "inbound", srv.SYSTEM_PROMPT)
+        ws_setup_and_check("CAepp000000000000000000000000002", "outbound-api", srv.OUTBOUND_SYSTEM_PROMPT)
+
+        # Rollback: unset vars -> bare base prompt again.
+        for k in keys:
+            os.environ.pop(k, None)
+        setup = dict(SETUP)
+        setup["callSid"] = "CAepp000000000000000000000000003"
+        with tc.websocket_connect("/ws") as ws:
+            ws.send_json(setup)
+            for _ in range(100):
+                if setup["callSid"] in srv.SESSIONS:
+                    break
+                time.sleep(0.05)
+        content = srv.SESSIONS["CAepp000000000000000000000000003"][0]["content"]
+        assert content == srv.SYSTEM_PROMPT and "VERIFIED OFFERS" not in content, (
+            "unset vars must restore the bare prompt"
+        )
+        print("EPP OFFERS WS CHECKS: pass")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -374,6 +455,7 @@ async def main():
     check_truncation()
     check_affirmative()
     check_repeat_guard()
+    check_epp_offers_ws()
     print("\nALL TESTS PASSED")
 
 

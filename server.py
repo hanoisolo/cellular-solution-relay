@@ -278,6 +278,38 @@ SMS_SYSTEM_PROMPT = (
     "No markdown, no bullet points, no lists, no asterisks."
 )
 
+# Verified EPP offers are owner-supplied data (Bell pricing grids), injected at
+# request time via RELAY_EPP_HARDWARE_OFFERS / RELAY_EPP_PLAN_OFFERS (e.g. as
+# Railway service vars). Empty = no offers block = prompts byte-identical to
+# the pre-grid behaviour, so unsetting the vars is a clean rollback.
+EPP_HARDWARE_OFFERS = ""
+EPP_PLAN_OFFERS = ""
+
+EPP_OFFERS_GUARDRAIL = (
+    "VERIFIED OFFERS GUARDRAILS: The VERIFIED OFFERS blocks below are the "
+    "ONLY pricing you may quote. Quote exactly, with the as-of date. Never "
+    "compute, estimate, or apply discounts yourself. Never invent a "
+    "price/plan/device not in a block. If asked about something not "
+    "listed, say the store will confirm it."
+)
+
+
+def with_offers(base: str) -> str:
+    """Append non-empty verified EPP offer blocks (hardware and/or rate plans)
+    plus the quoting guardrails to a base system prompt. Read per request so
+    Railway variable updates apply live without code changes."""
+    hw = _env_or("RELAY_EPP_HARDWARE_OFFERS", EPP_HARDWARE_OFFERS).strip()
+    plans = _env_or("RELAY_EPP_PLAN_OFFERS", EPP_PLAN_OFFERS).strip()
+    if not hw and not plans:
+        return base
+    parts = [base, EPP_OFFERS_GUARDRAIL]
+    if hw:
+        parts.append(f"VERIFIED HARDWARE OFFERS:\n{hw}")
+    if plans:
+        parts.append(f"VERIFIED RATE PLAN OFFERS:\n{plans}")
+    return "\n\n".join(parts)
+
+
 MOCK_REPLIES = {
     "price": (
         "I'm the automated assistant for Cellular Solution. I don't have live pricing "
@@ -910,13 +942,13 @@ async def sms_inbound(request: Request) -> Response:
 
     history = SMS_SESSIONS.get(from_number)
     if history is None:
-        history = [{"role": "system", "content": _env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT)}]
+        history = [{"role": "system", "content": with_offers(_env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT))}]
         SMS_SESSIONS[from_number] = history
         if len(SMS_SESSIONS) > MAX_SMS_SESSIONS:
             SMS_SESSIONS.pop(next(iter(SMS_SESSIONS)))
     else:
         # Re-read the prompt every turn so a Railway var change applies live.
-        history[0]["content"] = _env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT)
+        history[0]["content"] = with_offers(_env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT))
     history.append({"role": "user", "content": body_text})
     while len(history) > 1 + MAX_SMS_HISTORY_MESSAGES:
         del history[1]
@@ -959,7 +991,7 @@ async def relay_ws(websocket: WebSocket) -> None:
     await websocket.accept()
 
     call_sid = ""
-    history: list[dict] = [{"role": "system", "content": _env_or("RELAY_SYSTEM_PROMPT", SYSTEM_PROMPT)}]
+    history: list[dict] = [{"role": "system", "content": with_offers(_env_or("RELAY_SYSTEM_PROMPT", SYSTEM_PROMPT))}]
     callback_name: str | None = None
     callback_phone: str | None = None
     callback_logged = False
@@ -1158,7 +1190,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     if is_outbound:
                         history[0] = {
                             "role": "system",
-                            "content": _env_or("RELAY_OUTBOUND_SYSTEM_PROMPT", OUTBOUND_SYSTEM_PROMPT),
+                            "content": with_offers(_env_or("RELAY_OUTBOUND_SYSTEM_PROMPT", OUTBOUND_SYSTEM_PROMPT)),
                         }
                     # The greeting is spoken by the relay (not the LLM), so
                     # the model never sees it — and then it repeats the minute
