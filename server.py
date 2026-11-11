@@ -90,6 +90,16 @@ OUTBOUND_GREETING = (
     "Bell's Employee Purchase Program. Do you have a quick minute?"
 )
 
+# Spoken once at the start of every call as a NON-interruptible text token:
+# the caller must hear the AI + recording disclosure in full. The greeting
+# already names the assistant; this adds the recording notice and is sent
+# with interruptible=false so it cannot be cut off. Runtime-overridable
+# with RELAY_DISCLOSURE.
+DISCLOSURE = (
+    "You are speaking with Cellular Solution's automated AI assistant, "
+    "and this call is recorded."
+)
+
 OUTBOUND_SYSTEM_PROMPT = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
     "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
@@ -385,6 +395,30 @@ NAME_RES = [
     re.compile(r"\bI'?m ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
     re.compile(r"\bname'?s ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
 ]
+
+
+def _truncate_to_utterance(spoken: str, utterance: str) -> str:
+    """Cut a spoken reply down to what the caller actually heard.
+
+    On an interrupt, Twilio sends utteranceUntilInterrupt — the caller's
+    words up to the point they cut in. Keeping the full reply in history
+    would make Mistral believe it said things the caller never heard (a
+    price, a disclosure). If the utterance is not found verbatim (it can be
+    truncated mid-word), match its longest prefix that appears in the
+    spoken text; if nothing matches, the caller heard none of it.
+    """
+    if not utterance or not utterance.strip():
+        return spoken
+    u = utterance.strip().lower()
+    s = spoken.lower()
+    idx = s.find(u)
+    if idx != -1:
+        return spoken[: idx + len(u)]
+    for end in range(len(u), 0, -1):
+        idx = s.find(u[:end])
+        if idx != -1:
+            return spoken[: idx + end]
+    return ""
 
 
 def extract_phone(text: str) -> str | None:
@@ -820,8 +854,11 @@ async def relay_ws(websocket: WebSocket) -> None:
     # asked a different question that turn.
     callback_offered = False
     llm_task: asyncio.Task | None = None
+    # Accumulates the text already sent to Twilio for the in-flight reply, so
+    # an interrupt can truncate history to what the caller actually heard.
+    spoken_box = [""]
 
-    async def send_text_tokens(reply_stream) -> str:
+    async def send_text_tokens(reply_stream, spoken_box=None) -> str:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
         (raw, for history/logs).
@@ -872,6 +909,10 @@ async def relay_ws(websocket: WebSocket) -> None:
                 "cellular solution dot c a"
             )
             if spoken:
+                if spoken_box is not None:
+                    # What the caller actually heard so far, for interrupt
+                    # truncation (utteranceUntilInterrupt).
+                    spoken_box[0] += spoken
                 await websocket.send_json(
                     {
                         "type": "text",
@@ -978,6 +1019,21 @@ async def relay_ws(websocket: WebSocket) -> None:
                     SESSIONS[call_sid] = history
                     if len(SESSIONS) > MAX_SESSIONS:
                         SESSIONS.pop(next(iter(SESSIONS)))
+                if connection_type != "reconnect":
+                    # AI + recording disclosure, spoken right after the
+                    # welcome greeting and NOT interruptible: the caller
+                    # must hear it in full.
+                    disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
+                    await websocket.send_json(
+                        {
+                            "type": "text",
+                            "token": disclosure,
+                            "last": True,
+                            "interruptible": False,
+                            "preemptible": False,
+                        }
+                    )
+                    history.append({"role": "assistant", "content": disclosure})
                 log_event(
                     "session_start",
                     callSid=call_sid,
@@ -1091,11 +1147,67 @@ async def relay_ws(websocket: WebSocket) -> None:
                         }
                     )
 
+                spoken_box[0] = ""
                 try:
                     llm_task = asyncio.create_task(
-                        send_text_tokens(mistral_stream_reply(history))
+                        send_text_tokens(mistral_stream_reply(history), spoken_box)
                     )
-                    reply = await llm_task
+                    reply = ""
+                    # Race the LLM task against incoming Twilio messages so an
+                    # interrupt is handled WHILE the reply is still streaming,
+                    # not only after it finished.
+                    recv_task = None
+                    try:
+                        while True:
+                            recv_task = asyncio.ensure_future(websocket.receive_json())
+                            done, _pending = await asyncio.wait(
+                                {llm_task, recv_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if llm_task in done:
+                                reply = llm_task.result()
+                                break
+                            live = recv_task.result()
+                            if live.get("type") == "interrupt":
+                                llm_task.cancel()
+                                try:
+                                    await llm_task
+                                except asyncio.CancelledError:
+                                    pass
+                                utterance = (live.get("utteranceUntilInterrupt") or "").strip()
+                                # Keep only what the caller heard before cutting
+                                # in, so Mistral never thinks it said things the
+                                # caller never heard (a price, a disclosure).
+                                heard = _truncate_to_utterance(spoken_box[0], utterance)
+                                if heard:
+                                    history.append({"role": "assistant", "content": heard})
+                                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                                        del history[1]
+                                log_event(
+                                    "interrupt",
+                                    callSid=call_sid,
+                                    utteranceUntilInterrupt=utterance or None,
+                                    heard_chars=len(heard),
+                                )
+                                reply = ""
+                                break
+                            elif live.get("type") == "dtmf":
+                                log_event("dtmf", callSid=call_sid, digit=live.get("digit"))
+                            else:
+                                log_event(
+                                    "early_message", callSid=call_sid, type=live.get("type")
+                                )
+                    finally:
+                        # The websockets library forbids concurrent recv():
+                        # a still-pending receive task must be cancelled AND
+                        # awaited before the main loop calls receive_json().
+                        if recv_task is not None:
+                            if not recv_task.done():
+                                recv_task.cancel()
+                            try:
+                                await recv_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                 except asyncio.CancelledError:
                     log_event("reply_cancelled", callSid=call_sid)
                     continue
@@ -1120,6 +1232,8 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # The caller already hung up; nothing to say it to.
                         pass
                 finally:
+                    if llm_task is not None and not llm_task.done():
+                        llm_task.cancel()
                     llm_task = None
 
                 if reply:
