@@ -180,6 +180,36 @@ SYSTEM_PROMPT = (
     "No markdown, no lists, no bullet points, no special characters."
 )
 
+# SMS replies are plain text, not speech: the website stays
+# "cellularsolution.ca" verbatim — the "dot c a" pronunciation rewrite in
+# _speakable_text is voice-only and is never applied to SMS.
+SMS_SYSTEM_PROMPT = (
+    "You are Cellular Solution's automated SMS assistant, a Bell authorized "
+    "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
+    "Monday to Friday, 9am to 5pm. Store phone: 905-264-2228. "
+    "Always disclose in your first reply that you are Cellular Solution's "
+    "automated AI assistant, and combine that disclosure with a helpful answer. "
+    "Your job is to qualify interest in Bell mobility and the Bell Employee "
+    "Purchase Program (EPP): up to 30% off Bell mobility plans and no "
+    "activation fees. EPP is for employees of select partner companies, not "
+    "only Bell employees. Never say someone must work for Bell or ask if they "
+    "are a Bell employee. To check eligibility, tell them to visit "
+    "cellularsolution.ca, click Employee Offers, and type in their company "
+    "name. Proof of employment is shown after ordering. "
+    "Always write the website as cellularsolution.ca (never write 'dot c a'). "
+    "Answer basic questions about EPP. NEVER invent or promise a specific "
+    "price, plan detail, phone model price, or eligibility answer you cannot "
+    "verify; say the store will confirm it. "
+    "You do NOT have the list of partner companies; if someone names their "
+    "company, never say whether it is eligible or not — direct them to "
+    "cellularsolution.ca or offer a callback from the store. "
+    "Never close a sale and never take an order. "
+    "When the person is interested, offer a callback from the store (or they "
+    "can call 905-264-2228) and collect their name and phone number. "
+    "Keep every reply short: 1 to 3 sentences, plain text suitable for SMS. "
+    "No markdown, no bullet points, no lists, no asterisks."
+)
+
 MOCK_REPLIES = {
     "price": (
         "I'm the automated assistant for Cellular Solution. I don't have live pricing "
@@ -199,10 +229,30 @@ MOCK_REPLIES = {
     ),
 }
 
+
+def _mock_reply_for(history: list[dict]) -> str:
+    """Pick a canned reply from the latest user message (MOCK_LLM mode)."""
+    last_user = next(
+        (m["content"] for m in reversed(history) if m["role"] == "user"),
+        "",
+    )
+    lowered = last_user.lower()
+    if "callback" in lowered or "call me back" in lowered:
+        return MOCK_REPLIES["callback"]
+    if "price" in lowered or "cost" in lowered or "much" in lowered:
+        return MOCK_REPLIES["price"]
+    return MOCK_REPLIES["default"]
+
+
 # In-memory conversation history per callSid, so a dropped WebSocket can
 # reconnect (applicationReconnect=true) and pick up where it left off.
 SESSIONS: dict[str, list[dict]] = {}
 MAX_SESSIONS = 100
+
+# In-memory SMS history per sender (From number), capped like SESSIONS.
+SMS_SESSIONS: dict[str, list[dict]] = {}
+MAX_SMS_SESSIONS = 100
+MAX_SMS_HISTORY_MESSAGES = 20
 
 app = FastAPI(title="cellular-solution-relay")
 
@@ -259,6 +309,12 @@ def public_http_url(request: Request) -> str:
     if request.url.query:
         url = f"{url}?{request.url.query}"
     return url
+
+
+def _twilio_auth_token() -> str:
+    """Resolve the auth token per request, so runtime env changes (tests,
+    Railway var edits) apply without an import-time re-read."""
+    return os.environ.get("TWILIO_AUTH_TOKEN") or TWILIO_AUTH_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -407,18 +463,8 @@ async def mistral_stream_reply(
     history: list[dict],
 ) -> "asyncio.AsyncGenerator[str, None]":
     """Yield reply tokens from Mistral as they arrive (SSE stream)."""
-    if MOCK_LLM:
-        last_user = next(
-            (m["content"] for m in reversed(history) if m["role"] == "user"),
-            "",
-        )
-        lowered = last_user.lower()
-        if "callback" in lowered or "call me back" in lowered:
-            reply = MOCK_REPLIES["callback"]
-        elif "price" in lowered or "cost" in lowered or "much" in lowered:
-            reply = MOCK_REPLIES["price"]
-        else:
-            reply = MOCK_REPLIES["default"]
+    if MOCK_LLM or os.environ.get("MOCK_LLM", "") == "1":
+        reply = _mock_reply_for(history)
         # Yield word by word so the streaming path is exercised.
         for word in reply.split(" "):
             yield word + " "
@@ -465,6 +511,38 @@ async def mistral_stream_reply(
                     yield text
 
 
+async def mistral_sms_reply(history: list[dict]) -> str:
+    """Non-streaming Mistral reply for an inbound SMS (TwiML <Message> body).
+
+    SMS has no token-by-token playback, so the whole reply is fetched in
+    one request and returned as a single string.
+    """
+    if MOCK_LLM or os.environ.get("MOCK_LLM", "") == "1":
+        return _mock_reply_for(history)
+
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY is not set")
+
+    payload = {
+        "model": MISTRAL_MODEL,
+        "messages": history,
+        "temperature": 0.5,
+        "max_tokens": 300,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(MISTRAL_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        chunk = response.json()
+        return _content_to_text(
+            chunk.get("choices", [{}])[0].get("message", {}).get("content")
+        )
+
+
 # ---------------------------------------------------------------------------
 # HTTP endpoints.
 # ---------------------------------------------------------------------------
@@ -506,13 +584,14 @@ def conversation_relay_xml(ws_url: str, greeting: str) -> str:
 
 
 async def _twiml_response(request: Request, greeting: str) -> Response:
-    if request.method == "POST" and TWILIO_AUTH_TOKEN:
+    token = _twilio_auth_token()
+    if request.method == "POST" and token:
         body = await request.body()
         params = dict(parse_qsl(body.decode("utf-8", "replace")))
         signature = request.headers.get("x-twilio-signature", "")
         url = public_http_url(request)
         if not signature or not twilio_signature_valid(
-            url, params, signature, TWILIO_AUTH_TOKEN
+            url, params, signature, token
         ):
             log_event("twiml_signature_rejected", url=url)
             return Response(content="Forbidden", status_code=403)
@@ -541,15 +620,124 @@ async def twiml_outbound(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# SMS: inbound webhook + outbound send.
+# ---------------------------------------------------------------------------
+def message_twiml_xml(body: str) -> str:
+    """Build the <Response><Message> TwiML for an SMS reply."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Message>{_xml_escape(body)}</Message></Response>"
+    )
+
+
+EMPTY_RESPONSE_XML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
+
+async def send_sms(to: str, body: str) -> dict | None:
+    """Send an outbound SMS via the Twilio Messages API.
+
+    Env-gated: needs TWILIO_ACCOUNT_SID, TWILIO_FROM and either
+    TWILIO_AUTH_TOKEN or the TWILIO_API_KEY_SID/SECRET pair. When any are
+    missing, returns None and the caller stays logs-only. Never raises —
+    an SMS failure must not break a voice call.
+    """
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    from_number = os.environ.get("TWILIO_FROM", "").strip()
+    api_key_sid = os.environ.get("TWILIO_API_KEY_SID", "").strip()
+    api_key_secret = os.environ.get("TWILIO_API_KEY_SECRET", "").strip()
+    auth_token = _twilio_auth_token().strip()
+    if api_key_sid and api_key_secret:
+        auth = f"{api_key_sid}:{api_key_secret}"
+    elif account_sid and auth_token:
+        auth = f"{account_sid}:{auth_token}"
+    else:
+        auth = ""
+    if not account_sid or not auth or not from_number or not to:
+        return None
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(auth.encode()).decode(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                url,
+                data={"To": to, "From": from_number, "Body": body},
+                headers=headers,
+            )
+        result = response.json() if response.content else {}
+        if 200 <= response.status_code < 300:
+            log_event("sms_sent", to=to, sid=result.get("sid"), status=result.get("status"))
+            return result
+        log_event("sms_send_error", to=to, http=response.status_code, error=str(result)[:300])
+        return None
+    except Exception as exc:  # noqa: BLE001 - never break the call flow
+        log_event("sms_send_error", to=to, error=str(exc)[:300])
+        return None
+
+
+@app.post("/sms")
+async def sms_inbound(request: Request) -> Response:
+    """TwiML for inbound SMS on the Twilio number: the Mistral reply as a
+    <Message>. POST-only, so a plain GET can never trigger an LLM call."""
+    token = _twilio_auth_token()
+    body = await request.body()
+    params = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+    if token:
+        signature = request.headers.get("x-twilio-signature", "")
+        url = public_http_url(request)
+        if not signature or not twilio_signature_valid(url, params, signature, token):
+            log_event("sms_signature_rejected", url=url)
+            return Response(content="Forbidden", status_code=403)
+    else:
+        logger.warning("TWILIO_AUTH_TOKEN is not set: SMS signature validation is OFF.")
+
+    from_number = (params.get("From") or "").strip() or "unknown"
+    to_number = (params.get("To") or "").strip()
+    body_text = (params.get("Body") or "").strip()
+    log_event("sms_inbound", from_=from_number, to=to_number, body=body_text)
+
+    if not body_text:
+        return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
+
+    history = SMS_SESSIONS.get(from_number)
+    if history is None:
+        history = [{"role": "system", "content": _env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT)}]
+        SMS_SESSIONS[from_number] = history
+        if len(SMS_SESSIONS) > MAX_SMS_SESSIONS:
+            SMS_SESSIONS.pop(next(iter(SMS_SESSIONS)))
+    else:
+        # Re-read the prompt every turn so a Railway var change applies live.
+        history[0]["content"] = _env_or("RELAY_SMS_SYSTEM_PROMPT", SMS_SYSTEM_PROMPT)
+    history.append({"role": "user", "content": body_text})
+    while len(history) > 1 + MAX_SMS_HISTORY_MESSAGES:
+        del history[1]
+
+    try:
+        reply = await mistral_sms_reply(history)
+    except Exception as exc:  # noqa: BLE001 - keep the SMS thread alive
+        logger.exception("LLM error: %s", exc)
+        log_event("sms_llm_error", from_=from_number, error=str(exc))
+        reply = (
+            "Sorry, I'm having trouble right now. "
+            "The store can help you at 905-264-2228."
+        )
+    history.append({"role": "assistant", "content": reply})
+    log_event("sms_outbound_reply", to=from_number, body=reply)
+    return Response(content=message_twiml_xml(reply), media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
 # WebSocket: ConversationRelay session.
 # ---------------------------------------------------------------------------
 @app.websocket("/ws")
 async def relay_ws(websocket: WebSocket) -> None:
-    if TWILIO_AUTH_TOKEN:
+    token = _twilio_auth_token()
+    if token:
         signature = websocket.headers.get("x-twilio-signature", "")
         url = public_ws_url(websocket)
         if not signature or not twilio_signature_valid(
-            url, {}, signature, TWILIO_AUTH_TOKEN
+            url, {}, signature, token
         ):
             log_event("ws_signature_rejected", url=url)
             await websocket.close(code=1008)
@@ -786,6 +974,17 @@ async def relay_ws(websocket: WebSocket) -> None:
                         name=callback_name,
                         phone=callback_phone,
                     )
+                    # If the store wants SMS alerts, text the callback
+                    # details as they are captured. Env-gated: without
+                    # STORE_SMS_NUMBER (or Twilio creds) this stays logs-only.
+                    store_sms = os.environ.get("STORE_SMS_NUMBER", "").strip()
+                    if store_sms:
+                        asyncio.create_task(
+                            send_sms(
+                                store_sms,
+                                f"Callback request: {callback_name} {callback_phone} (call {call_sid})",
+                            )
+                        )
 
                 # Tell the LLM the number is complete: it can't reliably
                 # count digits across piecemeal turns, and without this it
