@@ -86,7 +86,7 @@ def main():
     http_paths = {r.path for r in app.routes
                   if hasattr(r, "methods") and r.path not in BUILTIN}
     ws_paths = {r.path for r in app.routes if not hasattr(r, "methods")}
-    check("route inventory", http_paths == {"/", "/health", "/twiml", "/twiml-outbound", "/sms", "/handoff"},
+    check("route inventory", http_paths == {"/", "/health", "/twiml", "/twiml-outbound", "/sms", "/handoff", "/amd"},
           f"http routes: {sorted(http_paths)}")
     check("websocket inventory", ws_paths == {"/ws"}, f"ws routes: {sorted(ws_paths)}")
 
@@ -234,6 +234,19 @@ def main():
     check("POST /handoff good signature -> 200 Dial store line",
           r.status_code == 200 and dial is not None and dial.text == "+19052642228",
           f"{r.status_code} {r.text[:200]}")
+
+    # --- /amd: AsyncAmdStatusCallback; POST-only, signature-checked, empty 200 ---
+    check("GET /amd -> 405", client.get("/amd").status_code == 405)
+    ap = {"CallSid": "CA123", "AnsweredBy": "machine_start"}
+    check("POST /amd missing signature -> 403",
+          client.post("/amd", data=ap).status_code == 403)
+    check("POST /amd bad signature -> 403",
+          client.post("/amd", data=ap, headers={"X-Twilio-Signature": "bogus"}).status_code == 403)
+    r = post_signed("/amd", ap, "tok-123")
+    check("POST /amd good signature -> 200 empty Response",
+          r.status_code == 200 and ET.fromstring(r.content).find("./Message") is None
+          and ET.fromstring(r.content).find("./Dial") is None,
+          f"{r.status_code} {r.text[:120]}")
     del os.environ["TWILIO_AUTH_TOKEN"]
 
     # --- send_sms is env-gated: no Twilio env -> None, no network ---

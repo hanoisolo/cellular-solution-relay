@@ -750,6 +750,29 @@ async def handoff_action(request: Request) -> Response:
     return Response(content=xml, media_type="application/xml")
 
 
+@app.post("/amd")
+async def amd_status(request: Request) -> Response:
+    """AsyncAmdStatusCallback for outbound calls: Twilio POSTs the AMD result
+    (AnsweredBy=human|machine_*|fax|unknown) here a few seconds into the
+    call. Logged only — the batch poll loop hangs up machine-answered calls.
+    Always returns an empty 200 so Twilio is not retried."""
+    token = _twilio_auth_token()
+    body = await request.body()
+    params = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+    if token:
+        signature = request.headers.get("x-twilio-signature", "")
+        url = public_http_url(request)
+        if not signature or not twilio_signature_valid(url, params, signature, token):
+            log_event("amd_signature_rejected", url=url)
+            return Response(content="Forbidden", status_code=403)
+    log_event(
+        "amd_result",
+        callSid=params.get("CallSid", ""),
+        answeredBy=params.get("AnsweredBy", ""),
+    )
+    return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
+
+
 # ---------------------------------------------------------------------------
 # SMS: inbound webhook + outbound send.
 # ---------------------------------------------------------------------------
