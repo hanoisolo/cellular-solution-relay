@@ -100,6 +100,31 @@ DISCLOSURE = (
     "and this call is recorded."
 )
 
+# On OUTBOUND calls the greeting already identifies the AI assistant, so the
+# recording notice is spoken only AFTER the caller positively answers the
+# greeting's "do you have a minute?" (owner decision, 2026-11-11), as a
+# non-interruptible token. Inbound calls get the full DISCLOSURE at setup.
+# Runtime-overridable with RELAY_RECORDING_DISCLOSURE.
+RECORDING_DISCLOSURE = "Just so you know, this call is recorded."
+
+AFFIRMATIVE_RE = re.compile(
+    r"\b(yes|yeah|yep|sure|okay|ok|go ahead|absolutely|of course|"
+    r"i have a minute|one minute|just a minute|a minute)\b",
+    re.IGNORECASE,
+)
+NEGATIVE_RE = re.compile(
+    r"\b(no|nope|not|busy|don't|dont|can't|cant|hang on|later|stop)\b",
+    re.IGNORECASE,
+)
+
+
+def is_affirmative(text: str) -> bool:
+    """True when a caller turn reads as a positive answer ("yes, go ahead")."""
+    t = (text or "").strip().lower()
+    if not t or NEGATIVE_RE.search(t):
+        return False
+    return bool(AFFIRMATIVE_RE.search(t))
+
 OUTBOUND_SYSTEM_PROMPT = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
     "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
@@ -925,6 +950,9 @@ async def relay_ws(websocket: WebSocket) -> None:
     # Accumulates the text already sent to Twilio for the in-flight reply, so
     # an interrupt can truncate history to what the caller actually heard.
     spoken_box = [""]
+    # Outbound calls: recording notice fires on the first affirmative answer.
+    is_outbound = False
+    recording_disclosed = False
 
     async def do_handoff(reason: str, extra: dict | None = None) -> None:
         """End the relay session; Twilio then POSTs the action URL (/handoff)
@@ -1100,21 +1128,27 @@ async def relay_ws(websocket: WebSocket) -> None:
                     SESSIONS[call_sid] = history
                     if len(SESSIONS) > MAX_SESSIONS:
                         SESSIONS.pop(next(iter(SESSIONS)))
+                is_outbound = str(message.get("direction", "")).startswith("outbound")
                 if connection_type != "reconnect":
-                    # AI + recording disclosure, spoken right after the
-                    # welcome greeting and NOT interruptible: the caller
-                    # must hear it in full.
-                    disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
-                    await websocket.send_json(
-                        {
-                            "type": "text",
-                            "token": disclosure,
-                            "last": True,
-                            "interruptible": False,
-                            "preemptible": False,
-                        }
-                    )
-                    history.append({"role": "assistant", "content": disclosure})
+                    if is_outbound:
+                        # Outbound: the greeting already names the AI; the
+                        # recording notice waits for a positive "minute" answer.
+                        recording_disclosed = False
+                    else:
+                        # Inbound: AI + recording disclosure right after the
+                        # welcome greeting, NOT interruptible.
+                        disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
+                        await websocket.send_json(
+                            {
+                                "type": "text",
+                                "token": disclosure,
+                                "last": True,
+                                "interruptible": False,
+                                "preemptible": False,
+                            }
+                        )
+                        history.append({"role": "assistant", "content": disclosure})
+                        recording_disclosed = True
                 log_event(
                     "session_start",
                     callSid=call_sid,
@@ -1139,6 +1173,23 @@ async def relay_ws(websocket: WebSocket) -> None:
                         "caller-requested-human", {"lastUtterance": user_text}
                     )
                     return
+
+                # Outbound + positive answer to "do you have a minute?":
+                # speak the recording notice now, non-interruptible.
+                if is_outbound and not recording_disclosed and is_affirmative(user_text):
+                    recording_disclosed = True
+                    notice = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
+                    await websocket.send_json(
+                        {
+                            "type": "text",
+                            "token": notice,
+                            "last": True,
+                            "interruptible": False,
+                            "preemptible": False,
+                        }
+                    )
+                    history.append({"role": "assistant", "content": notice})
+                    log_event("recording_disclosed", callSid=call_sid)
 
                 # Bare-name reply: the assistant just asked for the name and
                 # the caller answered with the name alone ("Jonathan."), or

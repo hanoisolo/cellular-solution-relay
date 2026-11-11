@@ -85,6 +85,18 @@ def check_truncation():
     print("TRUNCATION CHECKS: pass")
 
 
+def check_affirmative():
+    """is_affirmative gates the outbound recording notice."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import is_affirmative
+
+    for yes in ("Yes.", "yeah, go ahead", "sure, I have a minute", "ok", "of course"):
+        assert is_affirmative(yes), yes
+    for no in ("No, I'm busy", "not now", "", "what is this about?", "nope"):
+        assert not is_affirmative(no), no
+    print("AFFIRMATIVE CHECKS: pass")
+
+
 def check_signature_validator():
     """Verify server.validate against an independently computed HMAC-SHA1."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -259,8 +271,73 @@ async def main():
         print("HANDOFF (dtmf 0): pass — end + handoffData sent")
         await ws2.close()
 
+    # Outbound: NO disclosure token at setup (the greeting names the AI);
+    # the recording notice must wait for a positive "minute" answer.
+    setup3 = dict(SETUP)
+    setup3["callSid"] = "CAtest0000000000000000000000000002"
+    setup3["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws3:
+        await ws3.send(json.dumps(setup3))
+        try:
+            raw = await asyncio.wait_for(ws3.recv(), timeout=1.0)
+            raise AssertionError(f"unexpected message after outbound setup: {raw}")
+        except asyncio.TimeoutError:
+            pass
+        print("OUTBOUND SETUP: pass — nothing spoken before the caller answers")
+
+        await ws3.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "Yes, I have a minute.", "last": True}
+            )
+        )
+        seen = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws3.recv(), timeout=10)
+            m = json.loads(raw)
+            seen.append(m)
+            # stop at the LLM reply's final token (the notice is also last=true)
+            if (m.get("type") == "text" and m.get("last") is True
+                    and "recorded" not in (m.get("token") or "").lower()):
+                break
+        notices = [m for m in seen if m.get("type") == "text"
+                   and "recorded" in (m.get("token") or "").lower()]
+        assert notices, "no recording notice after affirmative answer"
+        assert notices[0].get("interruptible") is False and notices[0].get("last") is True, (
+            f"recording notice must be non-interruptible and final: {notices[0]}"
+        )
+        assert any("recorded" not in (m.get("token") or "").lower()
+                   for m in seen if m.get("type") == "text"), "no LLM reply after notice"
+        print("RECORDING NOTICE: pass — spoken non-interruptibly after 'yes'")
+        await ws3.close()
+
+    # Outbound + negative answer: no recording notice at all.
+    setup4 = dict(SETUP)
+    setup4["callSid"] = "CAtest0000000000000000000000000003"
+    setup4["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws4:
+        await ws4.send(json.dumps(setup4))
+        await asyncio.sleep(0.5)
+        await ws4.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "No, I'm busy right now.", "last": True}
+            )
+        )
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws4.recv(), timeout=4.0)
+                m = json.loads(raw)
+                assert "recorded" not in (m.get("token") or "").lower(), (
+                    f"recording notice fired on a negative answer: {m}"
+                )
+        except asyncio.TimeoutError:
+            pass
+        print("NEGATIVE ANSWER: pass — no recording notice")
+        await ws4.close()
+
     check_signature_validator()
     check_truncation()
+    check_affirmative()
     print("\nALL TESTS PASSED")
 
 
