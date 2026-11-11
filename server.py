@@ -1186,20 +1186,23 @@ async def relay_ws(websocket: WebSocket) -> None:
                     return
 
                 # Outbound + positive answer to "do you have a minute?":
-                # speak the recording notice now, non-interruptible.
+                # speak the recording notice now, non-interruptible. It is
+                # appended to history only AFTER the reply (appending it here
+                # would leave history ending in "assistant", which Mistral
+                # rejects with HTTP 400).
+                notice_to_log = None
                 if is_outbound and not recording_disclosed and is_affirmative(user_text):
                     recording_disclosed = True
-                    notice = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
+                    notice_to_log = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
                     await websocket.send_json(
                         {
                             "type": "text",
-                            "token": notice,
+                            "token": notice_to_log,
                             "last": True,
                             "interruptible": False,
                             "preemptible": False,
                         }
                     )
-                    history.append({"role": "assistant", "content": notice})
                     log_event("recording_disclosed", callSid=call_sid)
 
                 # Bare-name reply: the assistant just asked for the name and
@@ -1285,7 +1288,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                 # asks for "the last three digits" after already having
                 # all ten.
                 if phone_newly_captured:
-                    history.append(
+                    # Insert BEFORE the just-appended user message: Mistral
+                    # requires the LAST history entry to be user/tool, and a
+                    # trailing system message is a 400.
+                    history.insert(
+                        len(history) - 1,
                         {
                             "role": "system",
                             "content": (
@@ -1294,7 +1301,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 "number in your reply and do not ask for "
                                 "more digits."
                             ),
-                        }
+                        },
                     )
 
                 spoken_box[0] = ""
@@ -1331,8 +1338,10 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 heard = _truncate_to_utterance(spoken_box[0], utterance)
                                 if heard:
                                     history.append({"role": "assistant", "content": heard})
-                                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
-                                        del history[1]
+                                if notice_to_log:
+                                    history.append({"role": "assistant", "content": notice_to_log})
+                                while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                                    del history[1]
                                 log_event(
                                     "interrupt",
                                     callSid=call_sid,
@@ -1392,6 +1401,11 @@ async def relay_ws(websocket: WebSocket) -> None:
 
                 if reply:
                     history.append({"role": "assistant", "content": reply.strip()})
+                    if notice_to_log:
+                        # The recording notice was spoken before this reply;
+                        # record it after the reply so history keeps ending in
+                        # a role Mistral accepts at the START of the next turn.
+                        history.append({"role": "assistant", "content": notice_to_log})
                     # Keep only the system prompt plus the most recent turns.
                     while len(history) > 1 + MAX_HISTORY_MESSAGES:
                         del history[1]
