@@ -97,6 +97,17 @@ def check_affirmative():
     print("AFFIRMATIVE CHECKS: pass")
 
 
+def check_repeat_guard():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import is_repeat
+
+    assert is_repeat("Do you have a minute?", "Do you have a minute?")
+    assert is_repeat("Do you  have a minute?", "do you have a minute?")
+    assert not is_repeat("Do you have a minute?", "Sure, go ahead.")
+    assert not is_repeat("", "anything")
+    print("REPEAT GUARD CHECKS: pass")
+
+
 def check_signature_validator():
     """Verify server.validate against an independently computed HMAC-SHA1."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,8 +144,23 @@ async def main():
         print("Connected.")
         await ws.send(json.dumps(SETUP))
         print("SENT setup")
-        # The first message after setup must be the non-interruptible
-        # AI + recording disclosure.
+        # Inbound setup: first the greeting, then the AI+recording disclosure,
+        # BOTH non-interruptible text tokens (a caller saying "hello" must not
+        # cut the opening off).
+        from server import WELCOME_GREETING  # noqa: E402  (path set below)
+        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        greet = json.loads(raw)
+        print("RECV:", json.dumps(greet)[:300])
+        assert greet.get("type") == "text" and greet.get("last") is True, (
+            f"greeting must be a final text token: {greet}"
+        )
+        assert greet.get("interruptible") is False, (
+            f"greeting must be non-interruptible: {greet}"
+        )
+        assert greet.get("token") == WELCOME_GREETING, (
+            f"first token must be the welcome greeting: {greet.get('token')!r}"
+        )
+        print("GREETING: pass — spoken by relay, non-interruptible")
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         disc = json.loads(raw)
         print("RECV:", json.dumps(disc)[:300])
@@ -145,7 +171,7 @@ async def main():
             f"disclosure must be non-interruptible: {disc}"
         )
         token = disc.get("token", "").lower()
-        assert "recorded" in token and "ai assistant" in token, (
+        assert "recorded" in token and "ai assistant" in token and "quality assurance" in token, (
             f"disclosure missing AI/recording wording: {disc.get('token')!r}"
         )
         print("DISCLOSURE: pass — non-interruptible AI+recording notice on setup")
@@ -278,12 +304,21 @@ async def main():
     setup3["direction"] = "outbound-api"
     async with websockets.connect(WS_URL, max_size=2**20) as ws3:
         await ws3.send(json.dumps(setup3))
+        from server import OUTBOUND_GREETING  # noqa: E402
+        raw = await asyncio.wait_for(ws3.recv(), timeout=5)
+        greet = json.loads(raw)
+        assert greet.get("type") == "text" and greet.get("interruptible") is False \
+            and greet.get("token") == OUTBOUND_GREETING, (
+            f"outbound setup must speak the outbound greeting non-interruptibly: {greet}"
+        )
+        print("OUTBOUND GREETING: pass — non-interruptible, outbound wording")
+        # Nothing else before the caller answers (no recording notice yet).
         try:
             raw = await asyncio.wait_for(ws3.recv(), timeout=1.0)
-            raise AssertionError(f"unexpected message after outbound setup: {raw}")
+            raise AssertionError(f"unexpected message after outbound greeting: {raw}")
         except asyncio.TimeoutError:
             pass
-        print("OUTBOUND SETUP: pass — nothing spoken before the caller answers")
+        print("OUTBOUND SETUP: pass — no disclosure before a positive answer")
 
         await ws3.send(
             json.dumps(
@@ -338,6 +373,7 @@ async def main():
     check_signature_validator()
     check_truncation()
     check_affirmative()
+    check_repeat_guard()
     print("\nALL TESTS PASSED")
 
 

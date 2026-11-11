@@ -102,17 +102,21 @@ def main():
     check("POST /health -> 405", client.post("/health").status_code == 405)
 
     # --- /twiml and /twiml-outbound: GET renders ConversationRelay TwiML ---
+    # No welcomeGreeting attribute: the relay speaks the greeting itself as a
+    # NON-interruptible token on setup, so "hello" cannot cut it off.
     r = client.get("/twiml")
     root = ET.fromstring(r.content)
     cr = root.find("./Connect/ConversationRelay")
     check("GET /twiml", r.status_code == 200 and cr is not None
-          and cr.get("welcomeGreeting") == WELCOME_GREETING,
+          and cr.get("welcomeGreeting") in (None, ""),
           f"{r.status_code} {r.text[:200]}")
-    r = client.get("/twiml-outbound")
-    cr = ET.fromstring(r.content).find("./Connect/ConversationRelay")
-    check("GET /twiml-outbound", r.status_code == 200 and cr is not None
-          and cr.get("welcomeGreeting") == OUTBOUND_GREETING,
-          f"{r.status_code} {r.text[:200]}")
+    r_out = client.get("/twiml-outbound")
+    cr = ET.fromstring(r_out.content).find("./Connect/ConversationRelay")
+    check("GET /twiml-outbound", r_out.status_code == 200 and cr is not None
+          and cr.get("welcomeGreeting") in (None, ""),
+          f"{r_out.status_code} {r_out.text[:200]}")
+    check("twiml endpoints identical (greeting chosen by WS direction)",
+          r.content == r_out.content, "XML differs between /twiml and /twiml-outbound")
 
     # --- ConversationRelay hardening attributes (2026-11-11 tips pass) ---
     r = client.get("/twiml")
@@ -124,8 +128,8 @@ def main():
           all(w in (cr.get("hints") or "")
               for w in ("Bell", "Rogers", "Telus", "eSIM", "EID", "IMEI", "EPP", "905-264-2228")),
           f"hints: {cr.get('hints')}")
-    check("ConversationRelay keeps welcomeGreeting + reconnect",
-          cr.get("welcomeGreeting") == WELCOME_GREETING and cr.get("applicationReconnect") == "true",
+    check("ConversationRelay keeps reconnect + no welcomeGreeting attr",
+          cr.get("applicationReconnect") == "true" and cr.get("welcomeGreeting") in (None, ""),
           f"attrs: {dict(cr.attrib)}")
     connect_el = ET.fromstring(r.content).find("./Connect")
     check("Connect action URL points at /handoff (crash/handoff fallback)",

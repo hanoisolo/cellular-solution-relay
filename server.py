@@ -128,6 +128,16 @@ def is_affirmative(text: str) -> bool:
         return False
     return bool(AFFIRMATIVE_RE.search(t))
 
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def is_repeat(prev: str, cur: str) -> bool:
+    """True when the new reply is a verbatim repeat of the previous one —
+    backstop against the model looping the same sentence on a call."""
+    return bool(_norm_text(prev)) and _norm_text(prev) == _norm_text(cur)
+
 OUTBOUND_SYSTEM_PROMPT = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
     "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
@@ -682,8 +692,12 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-def conversation_relay_xml(ws_url: str, greeting: str) -> str:
-    """Build the <Connect><ConversationRelay> TwiML for one greeting."""
+def conversation_relay_xml(ws_url: str) -> str:
+    """Build the <Connect><ConversationRelay> TwiML.
+
+    No welcomeGreeting attribute: the relay speaks the greeting itself as a
+    non-interruptible token on setup, so a caller saying "hello" cannot cut
+    the opening off mid-sentence (the TwiML attribute is interruptible)."""
     # ttsProvider/voice are only included when explicitly configured:
     # Twilio rejected every explicit Google voice tried for en-CA
     # (en-CA-Standard-A and Google.en-CA-Neural2-A both → error 64101),
@@ -704,7 +718,6 @@ def conversation_relay_xml(ws_url: str, greeting: str) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>'
         f'<Response><Connect action="{escape_attr(action_url)}">'
         f'<ConversationRelay url="{ws_url}" '
-        f'welcomeGreeting="{escape_attr(greeting)}" '
         f'language="{RELAY_LANGUAGE}" '
         f"{tts_attrs}"
         f'transcriptionProvider="{RELAY_STT_PROVIDER}" '
@@ -720,7 +733,7 @@ def conversation_relay_xml(ws_url: str, greeting: str) -> str:
     )
 
 
-async def _twiml_response(request: Request, greeting: str) -> Response:
+async def _twiml_response(request: Request) -> Response:
     token = _twilio_auth_token()
     if request.method == "POST" and token:
         body = await request.body()
@@ -741,22 +754,24 @@ async def _twiml_response(request: Request, greeting: str) -> Response:
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
     ws_url = RELAY_WS_URL or f"wss://{host}/ws"
     return Response(
-        content=conversation_relay_xml(ws_url, greeting),
+        content=conversation_relay_xml(ws_url),
         media_type="application/xml",
     )
 
 
 @app.api_route("/twiml", methods=["GET", "POST"])
 async def twiml(request: Request) -> Response:
-    """TwiML for the Twilio number: connect the call to ConversationRelay."""
-    return await _twiml_response(request, _env_or("RELAY_WELCOME_GREETING", WELCOME_GREETING))
+    """TwiML for the Twilio number: connect the call to ConversationRelay.
+    The greeting is chosen by direction in the WS setup and spoken by the
+    relay as a non-interruptible token."""
+    return await _twiml_response(request)
 
 
 @app.api_route("/twiml-outbound", methods=["GET", "POST"])
 async def twiml_outbound(request: Request) -> Response:
-    """TwiML for outbound dials: same relay, but the greeting introduces
-    the call instead of thanking the person for calling."""
-    return await _twiml_response(request, _env_or("RELAY_OUTBOUND_GREETING", OUTBOUND_GREETING))
+    """TwiML for outbound dials: same relay XML; the setup message's
+    direction=outbound-api makes the relay use the outbound greeting/prompt."""
+    return await _twiml_response(request)
 
 
 @app.post("/handoff")
@@ -1124,6 +1139,11 @@ async def relay_ws(websocket: WebSocket) -> None:
             if msg_type == "setup":
                 call_sid = message.get("callSid", "")
                 connection_type = message.get("connectionType", "initial")
+                is_outbound = str(message.get("direction", "")).startswith("outbound")
+                if is_outbound:
+                    greeting = _env_or("RELAY_OUTBOUND_GREETING", OUTBOUND_GREETING)
+                else:
+                    greeting = _env_or("RELAY_WELCOME_GREETING", WELCOME_GREETING)
                 if connection_type == "reconnect" and call_sid in SESSIONS:
                     history = SESSIONS[call_sid]
                     log_event(
@@ -1135,33 +1155,42 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # Outbound dials get the outbound system prompt: the
                     # agent called the person, so it must introduce the
                     # call's purpose instead of asking "how can I help you".
-                    if str(message.get("direction", "")).startswith("outbound"):
+                    if is_outbound:
                         history[0] = {
                             "role": "system",
                             "content": _env_or("RELAY_OUTBOUND_SYSTEM_PROMPT", OUTBOUND_SYSTEM_PROMPT),
                         }
-                        greeting = _env_or("RELAY_OUTBOUND_GREETING", OUTBOUND_GREETING)
-                    else:
-                        greeting = _env_or("RELAY_WELCOME_GREETING", WELCOME_GREETING)
-                    # The greeting is spoken by Twilio before the LLM is
-                    # involved, so the model never sees it — and then it
-                    # repeats the minute question / EPP intro ("Do you have
-                    # a minute to learn about EPP?") right after the caller
-                    # already said yes. Seed it as the first assistant turn
-                    # so the model knows what was already said.
+                    # The greeting is spoken by the relay (not the LLM), so
+                    # the model never sees it — and then it repeats the minute
+                    # question / EPP intro right after the caller said yes.
+                    # Seed it as the first assistant turn so the model knows
+                    # what was already said.
                     history.append({"role": "assistant", "content": greeting})
                     SESSIONS[call_sid] = history
                     if len(SESSIONS) > MAX_SESSIONS:
                         SESSIONS.pop(next(iter(SESSIONS)))
-                is_outbound = str(message.get("direction", "")).startswith("outbound")
                 if connection_type != "reconnect":
+                    # The greeting is spoken as a NON-interruptible token: with
+                    # the TwiML welcomeGreeting attribute a caller saying
+                    # "hello" cut the greeting off mid-sentence (interruptible
+                    # defaults to "any"). Speaking it ourselves with
+                    # interruptible=false makes the opening uninterruptible.
+                    await websocket.send_json(
+                        {
+                            "type": "text",
+                            "token": greeting,
+                            "last": True,
+                            "interruptible": False,
+                            "preemptible": False,
+                        }
+                    )
                     if is_outbound:
                         # Outbound: the greeting already names the AI; the
                         # recording notice waits for a positive "minute" answer.
                         recording_disclosed = False
                     else:
                         # Inbound: AI + recording disclosure right after the
-                        # welcome greeting, NOT interruptible.
+                        # greeting, NOT interruptible.
                         disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
                         await websocket.send_json(
                             {
@@ -1415,6 +1444,16 @@ async def relay_ws(websocket: WebSocket) -> None:
                     llm_task = None
 
                 if reply:
+                    prev_assistant = next(
+                        (m["content"] for m in reversed(history) if m["role"] == "assistant"),
+                        "",
+                    )
+                    if is_repeat(prev_assistant, reply.strip()):
+                        log_event("repeat_guard", callSid=call_sid)
+                        reply = (
+                            "Understood — would you like the store to call you "
+                            "back with the details?"
+                        )
                     log_event(
                         "turn_done",
                         callSid=call_sid,
