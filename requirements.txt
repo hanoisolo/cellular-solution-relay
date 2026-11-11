@@ -1,0 +1,7 @@
+# Pinned 2026-11-11; verified installable on Python 3.12.
+fastapi==0.115.6
+uvicorn==0.34.0
+httpx==0.28.1
+# websockets is only used by test_ws.py (the client side of the test);
+# the server itself uses Starlette's built-in WebSocket support.
+websockets==14.1
