@@ -242,6 +242,38 @@ def main():
     check("POST /handoff good signature -> 200 Dial store line",
           r.status_code == 200 and dial is not None and dial.text == "+19052642228",
           f"{r.status_code} {r.text[:200]}")
+    # A plain hangup also fires the action URL. Dialling the store then rings a
+    # live line for a caller who is already gone, so a terminal CallStatus with
+    # no HandoffData must return empty TwiML instead.
+    for status in ("completed", "busy", "failed", "no-answer", "canceled"):
+        r = post_signed("/handoff", {"CallSid": "CA123", "CallStatus": status}, "tok-123")
+        root = ET.fromstring(r.content)
+        check(f"POST /handoff hangup (CallStatus={status}) -> no Dial",
+              r.status_code == 200 and root.find("./Dial") is None
+              and root.find("./Say") is None,
+              f"{r.status_code} {r.text[:200]}")
+    # An explicit handoff always dials, even if the call has already ended:
+    # the caller asked for a person and the store should still see the call.
+    r = post_signed("/handoff",
+                    {"CallSid": "CA123", "CallStatus": "completed",
+                     "HandoffData": '{"reason": "caller-requested-human"}'},
+                    "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff handoffData + ended call -> still dials",
+          r.status_code == 200 and dial is not None and dial.text == "+19052642228",
+          f"{r.status_code} {r.text[:200]}")
+    # A live call with no HandoffData (dropped socket) must still reach a person.
+    r = post_signed("/handoff", {"CallSid": "CA123", "CallStatus": "in-progress"}, "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff dropped socket (in-progress) -> dials",
+          r.status_code == 200 and dial is not None and dial.text == "+19052642228",
+          f"{r.status_code} {r.text[:200]}")
+    # Twilio omits CallStatus on some action callbacks; keep the old behaviour.
+    r = post_signed("/handoff", {"CallSid": "CA123"}, "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff no CallStatus -> dials (unchanged)",
+          r.status_code == 200 and dial is not None and dial.text == "+19052642228",
+          f"{r.status_code} {r.text[:200]}")
 
     # --- /amd: AsyncAmdStatusCallback; POST-only, signature-checked, empty 200 ---
     check("GET /amd -> 405", client.get("/amd").status_code == 405)

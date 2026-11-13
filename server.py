@@ -1157,6 +1157,14 @@ async def twiml_outbound(request: Request) -> Response:
     return await _twiml_response(request)
 
 
+# CallStatus values that mean the caller is already gone. <Connect>'s action
+# URL fires on a plain hangup as well as on a handoff, so these are the cases
+# where dialling the store would ring a live line for nobody.
+TERMINAL_CALL_STATUSES = frozenset(
+    {"completed", "busy", "failed", "no-answer", "canceled", "cancelled"}
+)
+
+
 @app.post("/handoff")
 async def handoff_action(request: Request) -> Response:
     """Action URL of <Connect>: fires when the relay session ends (human
@@ -1171,11 +1179,26 @@ async def handoff_action(request: Request) -> Response:
         if not signature or not twilio_signature_valid(url, params, signature, token):
             log_event("handoff_signature_rejected", url=url)
             return Response(content="Forbidden", status_code=403)
+    handoff_data = (params.get("HandoffData") or "").strip()
+    call_status = (params.get("CallStatus") or "").strip().lower()
     log_event(
         "handoff_action",
         callSid=params.get("CallSid", ""),
-        handoffData=(params.get("HandoffData") or "")[:500],
+        callStatus=call_status or None,
+        handoffData=handoff_data[:500],
     )
+    # A plain hangup lands here too: the action URL fires whenever the session
+    # ends, including when the caller simply hangs up. Dialling the store then
+    # rings a live line for a caller who is already gone, and the store picks
+    # up silence. Only dial when the relay asked for a handoff (HandoffData) or
+    # the call is still up; an absent CallStatus keeps the old behaviour.
+    if not handoff_data and call_status in TERMINAL_CALL_STATUSES:
+        log_event(
+            "handoff_skipped_call_ended",
+            callSid=params.get("CallSid", ""),
+            callStatus=call_status,
+        )
+        return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
     store = os.environ.get("RELAY_STORE_NUMBER", "").strip() or "+19052642228"
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
