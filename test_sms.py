@@ -47,6 +47,7 @@ from server import (  # noqa: E402
     SYSTEM_PROMPT,
     OUTBOUND_SYSTEM_PROMPT,
     WELCOME_GREETING,
+    OPENING_QUESTION,
     OUTBOUND_GREETING,
     DISCLOSURE,
     RECORDING_DISCLOSURE,
@@ -277,6 +278,22 @@ def main():
     check("outbound recording notice: recorded for quality assurance",
           "being recorded for quality assurance" in RECORDING_DISCLOSURE.lower(),
           f"RECORDING_DISCLOSURE: {RECORDING_DISCLOSURE!r}")
+    # --- Inbound opening: the AI self-introduction is spoken exactly once ---
+    # The greeting and the disclosure are two back-to-back non-interruptible
+    # tokens. Both used to introduce the assistant ("You're speaking with our
+    # automated assistant" then "You are speaking with Cellular Solution's
+    # automated AI assistant"), so callers heard the same sentence twice.
+    check("inbound opening: greeting does not re-introduce the assistant",
+          not any(p in WELCOME_GREETING.lower()
+                  for p in ("automated assistant", "ai assistant", "speaking with")),
+          f"WELCOME_GREETING duplicates the disclosure's self-introduction: {WELCOME_GREETING!r}")
+    check("inbound opening: business name spoken once (greeting only)",
+          "cellular solution" in WELCOME_GREETING.lower()
+          and "cellular solution" not in DISCLOSURE.lower(),
+          f"DISCLOSURE repeats the business name: {DISCLOSURE!r}")
+    check("inbound opening: the question is spoken last, not inside the greeting",
+          "?" not in WELCOME_GREETING and OPENING_QUESTION.strip().endswith("?"),
+          f"WELCOME_GREETING={WELCOME_GREETING!r} OPENING_QUESTION={OPENING_QUESTION!r}")
     check("no birthday/Phil leftovers in compiled greetings or disclosures",
           all("birthday" not in t.lower() and "phil" not in t.lower()
               for t in (WELCOME_GREETING, OUTBOUND_GREETING, DISCLOSURE, RECORDING_DISCLOSURE)),

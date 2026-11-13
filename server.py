@@ -76,11 +76,17 @@ def _env_or(name: str, default: str) -> str:
     request, not at import time. An empty value falls back to the default."""
     return os.environ.get(name) or default
 
-WELCOME_GREETING = (
-    "Hi, thanks for calling Cellular Solution. "
-    "You're speaking with our automated assistant. "
-    "How can I help you today?"
-)
+# The inbound opening is three back-to-back non-interruptible tokens:
+#   greeting -> disclosure -> question
+# Each says something the others do not. The greeting used to introduce the
+# assistant as well, so callers heard the same self-introduction twice (the
+# disclosure repeats it), and the question used to sit inside the greeting,
+# so it was asked before the recording notice instead of last.
+WELCOME_GREETING = "Hi, thanks for calling Cellular Solution."
+
+# Spoken last in the inbound opening, after the disclosure, so the caller is
+# invited to talk only once the compliance notice has finished.
+OPENING_QUESTION = "How can I help you today?"
 
 # Outbound calls (the agent dials a lead) must NOT sound like an inbound
 # call: the first test calls used the inbound greeting for an outbound
@@ -92,12 +98,12 @@ OUTBOUND_GREETING = (
 )
 
 # Spoken once at the start of every call as a NON-interruptible text token:
-# the caller must hear the AI + recording disclosure in full. The greeting
-# already names the assistant; this adds the recording notice and is sent
-# with interruptible=false so it cannot be cut off. Runtime-overridable
-# with RELAY_DISCLOSURE.
+# the caller must hear the AI + recording disclosure in full. "our" rather
+# than "Cellular Solution's" because the greeting has just named the store —
+# saying the name twice in a row was the repeat callers reported.
+# Runtime-overridable with RELAY_DISCLOSURE.
 DISCLOSURE = (
-    "You are speaking with Cellular Solution's automated AI assistant, "
+    "You are speaking with our automated AI assistant, "
     "and this call is being recorded for quality assurance."
 )
 
@@ -201,9 +207,11 @@ SYSTEM_PROMPT = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
     "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
     "Monday to Friday, 9am to 5pm. Store phone: 905-264-2228. "
-    "You are an automated assistant, not a person. The greeting already "
+    "You are an automated assistant, not a person. The opening already "
     "introduced you as one, so never make the disclosure your whole reply — "
-    "always combine it with something useful in the same reply. "
+    "always combine it with something useful in the same reply. The opening "
+    "also already asked how you can help, so never ask that again — answer "
+    "what the caller actually said. "
     "Your job is to qualify interest in Bell mobility and the Bell Employee "
     "Purchase Program, known as EPP: up to 30 percent off Bell mobility "
     "plans and no activation fees. EPP is for employees of select partner "
@@ -1202,39 +1210,46 @@ async def relay_ws(websocket: WebSocket) -> None:
                     if len(SESSIONS) > MAX_SESSIONS:
                         SESSIONS.pop(next(iter(SESSIONS)))
                 if connection_type != "reconnect":
-                    # The greeting is spoken as a NON-interruptible token: with
+                    # The opening is spoken as NON-interruptible tokens: with
                     # the TwiML welcomeGreeting attribute a caller saying
                     # "hello" cut the greeting off mid-sentence (interruptible
                     # defaults to "any"). Speaking it ourselves with
                     # interruptible=false makes the opening uninterruptible.
-                    await websocket.send_json(
-                        {
-                            "type": "text",
-                            "token": greeting,
-                            "last": True,
-                            "interruptible": False,
-                            "preemptible": False,
-                        }
-                    )
-                    if is_outbound:
-                        # Outbound: the greeting already names the AI; the
-                        # recording notice waits for a positive "minute" answer.
-                        recording_disclosed = False
-                    else:
-                        # Inbound: AI + recording disclosure right after the
-                        # greeting, NOT interruptible.
-                        disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
+                    async def _speak_opening(text: str) -> None:
                         await websocket.send_json(
                             {
                                 "type": "text",
-                                "token": disclosure,
+                                "token": text,
                                 "last": True,
                                 "interruptible": False,
                                 "preemptible": False,
                             }
                         )
+
+                    await _speak_opening(greeting)
+                    if is_outbound:
+                        # Outbound: the greeting already names the AI and ends
+                        # with the minute question; the recording notice waits
+                        # for a positive answer.
+                        recording_disclosed = False
+                        opening = greeting
+                    else:
+                        # Inbound: greeting -> AI + recording disclosure ->
+                        # question, so the caller is invited to speak only
+                        # after the compliance notice has finished.
+                        disclosure = _env_or("RELAY_DISCLOSURE", DISCLOSURE)
+                        await _speak_opening(disclosure)
+                        await _speak_opening(OPENING_QUESTION)
                         history.append({"role": "assistant", "content": disclosure})
+                        history.append(
+                            {"role": "assistant", "content": OPENING_QUESTION}
+                        )
                         recording_disclosed = True
+                        opening = f"{greeting} {disclosure} {OPENING_QUESTION}"
+                    # The opening is spoken by the relay, not the model, so it
+                    # never reached the turn log: a transcript could not show
+                    # what the caller actually heard at the start of the call.
+                    log_event("turn", callSid=call_sid, role="assistant", text=opening)
                 log_event(
                     "session_start",
                     callSid=call_sid,

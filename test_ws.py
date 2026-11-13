@@ -225,10 +225,11 @@ async def main():
         print("Connected.")
         await ws.send(json.dumps(SETUP))
         print("SENT setup")
-        # Inbound setup: first the greeting, then the AI+recording disclosure,
-        # BOTH non-interruptible text tokens (a caller saying "hello" must not
-        # cut the opening off).
-        from server import WELCOME_GREETING  # noqa: E402  (path set below)
+        # Inbound setup: greeting, then the AI+recording disclosure, then the
+        # question — three non-interruptible text tokens (a caller saying
+        # "hello" must not cut the opening off, and the question must come
+        # last so the caller is invited to talk only after the notice).
+        from server import WELCOME_GREETING, OPENING_QUESTION  # noqa: E402  (path set below)
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         greet = json.loads(raw)
         print("RECV:", json.dumps(greet)[:300])
@@ -256,6 +257,20 @@ async def main():
             f"disclosure missing AI/recording wording: {disc.get('token')!r}"
         )
         print("DISCLOSURE: pass — non-interruptible AI+recording notice on setup")
+
+        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        question = json.loads(raw)
+        print("RECV:", json.dumps(question)[:300])
+        assert question.get("type") == "text" and question.get("last") is True, (
+            f"opening question must be a final text token: {question}"
+        )
+        assert question.get("interruptible") is False, (
+            f"opening question must be non-interruptible: {question}"
+        )
+        assert question.get("token") == OPENING_QUESTION, (
+            f"opening must end with the question: {question.get('token')!r}"
+        )
+        print("OPENING QUESTION: pass — spoken last, non-interruptible")
 
         await ws.send(json.dumps(PROMPT))
         print("SENT prompt (callback request with name + phone)")
@@ -360,7 +375,8 @@ async def main():
     setup2["callSid"] = "CAtest0000000000000000000000000001"
     async with websockets.connect(WS_URL, max_size=2**20) as ws2:
         await ws2.send(json.dumps(setup2))
-        await asyncio.wait_for(ws2.recv(), timeout=10)  # disclosure token
+        for _ in range(3):  # greeting, disclosure, question
+            await asyncio.wait_for(ws2.recv(), timeout=10)
         await ws2.send(json.dumps({"type": "dtmf", "digit": "0"}))
         end_msg = None
         try:
