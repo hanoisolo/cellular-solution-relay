@@ -1399,6 +1399,260 @@ async def check_phone_ambiguous_ws():
     print("PHONE AMBIGUITY: pass — no number stored from an unclear digit run")
 
 
+async def check_name_reask_ws():
+    """End-to-end: when the caller's answer to the name question is not a
+    usable name, the relay must tell the model so it asks again.
+
+    A live call (CA2903) heard "Done." for "Don". The model accepted it as the
+    name and moved on to the time question, but the bare-name path refuses
+    stop-words, so state["callback_name"] stayed None and the CALLBACK_REQUEST
+    block never fired: no log event, no store SMS, and the store never learned
+    who to ask for. The relay now reconciles the two, the same way the phone
+    notes do.
+    """
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async def _session(call_sid, utterances):
+        setup = dict(SETUP)
+        setup["callSid"] = call_sid
+        setup["direction"] = "inbound"
+        replies = []
+        async with websockets.connect(WS_URL, max_size=2**20) as ws:
+            await ws.send(json.dumps(setup))
+            await asyncio.sleep(0.5)
+            for utterance in utterances:
+                await ws.send(
+                    json.dumps(
+                        {"type": "prompt", "voicePrompt": utterance, "last": True}
+                    )
+                )
+                replies.append(await _spoken(ws))
+        return replies
+
+    # A1: an unusable name gets one re-ask note. The probe is a question, so
+    # it does not itself count as another failed attempt.
+    replies = await _session(
+        "CAtest0000000000000000000000000021",
+        ["askname", "Curious.", "how many reask notes? namereaskcount"],
+    )
+    assert replies[-1].split()[0] == "reask_notes=1", (
+        f"the model was not told the name was unusable: {replies[-1]!r}"
+    )
+
+    # A2: a caller who answers the name question with a question of their own
+    # has not failed to give a name — the model must answer, not re-ask.
+    replies = await _session(
+        "CAtest0000000000000000000000000022",
+        ["askname", "why do you need my name? namereaskcount"],
+    )
+    assert replies[-1].split()[0] == "reask_notes=0", (
+        f"a question about the name was treated as a failed attempt: {replies[-1]!r}"
+    )
+
+    # A3: a usable name must not trigger the note at all.
+    replies = await _session(
+        "CAtest0000000000000000000000000023",
+        ["askname", "Don", "how many reask notes? namereaskcount"],
+    )
+    assert replies[-1].split()[0] == "reask_notes=0", (
+        f"the note fired even though the name was captured: {replies[-1]!r}"
+    )
+    print("NAME REASK: pass — an unusable name is reported, a question is not")
+
+
+async def check_name_escape_hatch_ws():
+    """End-to-end: a caller who never gives a usable name still gets a
+    callback recorded, and the model is told to stop asking.
+
+    Without this, a persistent STT error ("Done." for "Don") would either loop
+    forever or lose the whole callback request. The relay gives up after
+    MAX_NAME_ATTEMPTS and records the phone alone, so the store still gets the
+    lead.
+    """
+    from server import MAX_NAME_ATTEMPTS  # noqa: E402
+
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000024"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        turns = ["I want a callback", "4160001111"]
+        turns += ["Curious."] * (MAX_NAME_ATTEMPTS + 1)
+        for utterance in turns:
+            await ws.send(
+                json.dumps({"type": "prompt", "voicePrompt": utterance, "last": True})
+            )
+            await _spoken(ws)
+        # The probes are questions, so they add no attempts of their own.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "how many give-up notes? giveupcount",
+                    "last": True,
+                }
+            )
+        )
+        giveup = await _spoken(ws)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "how many reask notes? namereaskcount",
+                    "last": True,
+                }
+            )
+        )
+        reask = await _spoken(ws)
+        assert giveup.split()[0] == "giveup_notes=1", (
+            f"the model was never told to stop asking for the name: {giveup!r}"
+        )
+        assert reask.split()[0] == f"reask_notes={MAX_NAME_ATTEMPTS}", (
+            f"expected {MAX_NAME_ATTEMPTS} re-asks before giving up, got {reask!r}"
+        )
+        # The callback must actually be RECORDED, not just present in the
+        # handoff payload (do_handoff includes the callback when either half
+        # is known, so the payload alone does not prove CALLBACK_REQUEST
+        # fired). The callback-done note is only inserted when
+        # state["callback_logged"] is true, so it is the observable.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "how many callback done notes? callbackdonecount",
+                    "last": True,
+                }
+            )
+        )
+        done = await _spoken(ws)
+        assert done.split()[0] != "callback_done_notes=0", (
+            f"the phone-only callback was never recorded: {done!r}"
+        )
+        # And the handoff payload still carries the phone.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Can I speak to a representative?",
+                    "last": True,
+                }
+            )
+        )
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") == "end":
+                hd = json.loads(m.get("handoffData") or "{}")
+                cb = hd.get("callback") or {}
+                assert cb.get("phone") == "+14160001111", (
+                    f"the phone-only callback was lost: {hd}"
+                )
+                assert not cb.get("name"), (
+                    f"a stop-word was stored as a name: {hd}"
+                )
+                break
+        else:
+            raise AssertionError("no end message after the handoff request")
+    print("NAME ESCAPE HATCH: pass — phone-only callback after repeated failures")
+
+
+async def check_callback_done_note_ws():
+    """End-to-end: once the callback is booked, the model must be told so.
+
+    A live call (CA2903) confirmed the callback at 13:59:49 ("the store will
+    call you at 416-522-3344") and then offered it again at 14:00:21 ("Would
+    you like the store to call you back about Bell's Employee Purchase
+    Program?"), because the post-pitch prompt still says the next step is the
+    callback offer and nothing told the model it was already arranged.
+    """
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async def _session(call_sid, utterances):
+        setup = dict(SETUP)
+        setup["callSid"] = call_sid
+        setup["direction"] = "inbound"
+        replies = []
+        async with websockets.connect(WS_URL, max_size=2**20) as ws:
+            await ws.send(json.dumps(setup))
+            await asyncio.sleep(0.5)
+            for utterance in utterances:
+                await ws.send(
+                    json.dumps(
+                        {"type": "prompt", "voicePrompt": utterance, "last": True}
+                    )
+                )
+                replies.append(await _spoken(ws))
+        return replies
+
+    # B1: after the callback is booked the note is present, and it stays
+    # present on later turns (a once-only note would be evicted by the
+    # history trim).
+    replies = await _session(
+        "CAtest0000000000000000000000000025",
+        [
+            "I want a callback",
+            "4160001111",
+            "Don",
+            "how many callback done notes? callbackdonecount",
+            "how many callback done notes? callbackdonecount",
+        ],
+    )
+    assert replies[3].split()[0] != "callback_done_notes=0", (
+        f"the model was not told the callback was already booked: {replies[3]!r}"
+    )
+    assert replies[4].split()[0] != "callback_done_notes=0", (
+        f"the callback-done note did not survive to the next turn: {replies[4]!r}"
+    )
+
+    # B2: before any callback is booked the note must not appear, or the model
+    # would be told to stop offering a callback it never offered.
+    replies = await _session(
+        "CAtest0000000000000000000000000026",
+        ["how many callback done notes? callbackdonecount"],
+    )
+    assert replies[0].split()[0] == "callback_done_notes=0", (
+        f"the callback-done note fired before any callback: {replies[0]!r}"
+    )
+    print("CALLBACK DONE NOTE: pass — a booked callback is not offered again")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -1852,6 +2106,9 @@ async def main():
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()
+    await check_name_reask_ws()
+    await check_name_escape_hatch_ws()
+    await check_callback_done_note_ws()
     print("\nALL TESTS PASSED")
 
 

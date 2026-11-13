@@ -686,6 +686,10 @@ MOCK_REPLIES = {
     # Report which outbound prompt phase the model is being given.
     "pitch_seen": "Yes, the post-pitch prompt is in place.",
     "pitch_missing": "No, the pre-pitch prompt is still in place.",
+    # Name-capture probes. Only reachable in MOCK_LLM mode.
+    "askname": "Sure — what's your first name?",
+    "sttname": "Sorry, what's your first name?",
+    "gotnumber": "Got it, 416-000-1111. What's your first name?",
 }
 
 
@@ -696,6 +700,39 @@ def _mock_reply_for(history: list[dict]) -> str:
         "",
     )
     lowered = last_user.lower()
+    # Count probes first: "callbackdonecount" contains "callback", and the
+    # name probes must not fall through to the generic replies.
+    if "namereaskcount" in lowered:
+        n = sum(
+            1
+            for m in history
+            if m.get("role") == "system" and NAME_REASK_NOTE in (m.get("content") or "")
+        )
+        return f"reask_notes={n} in the history."
+    if "giveupcount" in lowered:
+        n = sum(
+            1
+            for m in history
+            if m.get("role") == "system"
+            and NAME_GIVE_UP_NOTE in (m.get("content") or "")
+        )
+        return f"giveup_notes={n} in the history."
+    if "callbackdonecount" in lowered:
+        n = sum(
+            1
+            for m in history
+            if m.get("role") == "system"
+            and "ALREADY arranged on this call" in (m.get("content") or "")
+        )
+        return f"callback_done_notes={n} in the history."
+    if "askname" in lowered:
+        return MOCK_REPLIES["askname"]
+    if "curious" in lowered:
+        # A stop-word from NAME_STOPWORDS, so the bare-name path refuses it —
+        # the "Done." for "Don" case.
+        return MOCK_REPLIES["sttname"]
+    if "4160001111" in lowered:
+        return MOCK_REPLIES["gotnumber"]
     if "pitchref" in lowered:
         swapped = any(
             m.get("role") == "system"
@@ -750,6 +787,7 @@ def new_call_state() -> dict:
         "phone_buffer": "",
         "phone_ambiguous": False,
         "expecting_name": False,
+        "name_attempts": 0,
         "callback_offered": False,
         "recording_disclosed": False,
         "caller_turns": 0,
@@ -883,6 +921,26 @@ NAME_RES = [
     re.compile(r"\bI'?m ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
     re.compile(r"\bname'?s ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
 ]
+
+# Name-capture reconciliation. A live call (CA2903) heard "Done." for "Don":
+# the model accepted it as the name and moved on, but the bare-name path
+# refuses stop-words, so state["callback_name"] stayed None and the
+# CALLBACK_REQUEST block never fired — no log event, no store SMS. The relay
+# now tells the model what it actually captured, the same way the phone notes
+# do. Bounded so a persistent STT error cannot loop forever.
+MAX_NAME_ATTEMPTS = 2
+
+NAME_REASK_NOTE = (
+    "The caller's reply did not contain a usable first name. Ask for their "
+    "first name again, briefly, as one short question."
+)
+
+NAME_GIVE_UP_NOTE = (
+    "The caller has not given a usable first name after repeated asks. Do NOT "
+    "ask for the name again. Confirm the callback using the phone number you "
+    "already have, and say the store will ask for their name when they call "
+    "back."
+)
 
 # The caller asks for a person ("representative", "agent", "a real person").
 # Matching this hands the call to the store instead of answering.
@@ -1898,6 +1956,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                 # the caller volunteered a bare first name after a callback
                 # was offered. A bare name is a single word; two words are
                 # only accepted right after an explicit name question.
+                # Captured before the bare-name block below consumes it: True
+                # on the turn right after the assistant asked for the name.
+                name_asked_this_turn = bool(state["expecting_name"])
                 words = user_text.strip().strip(".,!?").split()
                 fillers = NAME_STOPWORDS | {
                     "uh", "um", "yeah", "yes", "no", "ok", "okay",
@@ -1956,13 +2017,45 @@ async def relay_ws(websocket: WebSocket) -> None:
                 if name:
                     state["callback_name"] = name
 
+                # Reconcile the model's judgement with the relay's, the same
+                # way the phone notes below do: the model may accept a
+                # stop-word ("Done." for "Don") as a name, but the bare-name
+                # path above refuses it, so state["callback_name"] stays None
+                # and the CALLBACK_REQUEST block would never fire. Inserted at
+                # len(history)-1 so the last entry stays the user message (a
+                # trailing system message is a Mistral 400).
+                if (
+                    name_asked_this_turn
+                    and not state["callback_name"]
+                    and not _caller_asked(user_text)
+                ):
+                    # Only a real attempt counts: a caller who answers the
+                    # name question with a question of their own has not
+                    # failed to give a name, and the model should answer them
+                    # rather than re-ask.
+                    state["name_attempts"] += 1
+                    note = (
+                        NAME_REASK_NOTE
+                        if state["name_attempts"] <= MAX_NAME_ATTEMPTS
+                        else NAME_GIVE_UP_NOTE
+                    )
+                    history.insert(
+                        len(history) - 1, {"role": "system", "content": note}
+                    )
+
                 # Log the callback as soon as both halves are known, instead
                 # of waiting for a later assistant reply that happens to
-                # contain the word "callback".
+                # contain the word "callback". A caller who never gives a
+                # usable name still gets a callback: after MAX_NAME_ATTEMPTS
+                # the phone alone is enough, so the store is not left with
+                # nothing (live call CA2903 lost the whole request that way).
                 if (
                     not state["callback_logged"]
                     and state["callback_phone"]
-                    and state["callback_name"]
+                    and (
+                        state["callback_name"]
+                        or state["name_attempts"] > MAX_NAME_ATTEMPTS
+                    )
                 ):
                     state["callback_logged"] = True
                     log_event(
@@ -1979,9 +2072,35 @@ async def relay_ws(websocket: WebSocket) -> None:
                         asyncio.create_task(
                             send_sms(
                                 store_sms,
-                                f"Callback request: {state['callback_name']} {state['callback_phone']} (call {call_sid})",
+                                f"Callback request: {state['callback_name'] or 'name not provided'} {state['callback_phone']} (call {call_sid})",
                             )
                         )
+
+                # Surface the booked callback to the model. A live call
+                # (CA2903) confirmed the callback at 13:59:49 and then offered
+                # it again at 14:00:21, because the post-pitch prompt still
+                # says "your next step is the callback offer" and nothing told
+                # the model the callback was already arranged. Inserted on
+                # EVERY turn while the callback is booked: a once-only note
+                # would be evicted by the MAX_HISTORY_MESSAGES trim (only
+                # history[0] is permanent), and a prompt rule alone has
+                # already lost to state twice in this codebase.
+                if state["callback_logged"]:
+                    history.insert(
+                        len(history) - 1,
+                        {
+                            "role": "system",
+                            "content": (
+                                "A store callback is ALREADY arranged on this "
+                                f"call: {state['callback_name'] or 'the caller'} "
+                                f"at {state['callback_phone']}. Do not offer, "
+                                "ask about, or re-arrange a callback again. You "
+                                "may confirm it in one sentence if relevant; "
+                                "otherwise answer the caller's question or "
+                                "close the call politely."
+                            ),
+                        },
+                    )
 
                 # Tell the LLM the number is complete: it can't reliably
                 # count digits across piecemeal turns, and without this it
