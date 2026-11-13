@@ -913,15 +913,20 @@ async def check_pitch_phase_ws():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
-        # A decline is the one first turn the relay does not pitch on, so it
-        # is the only way to get a model reply while still in phase 1.
-        before = await say(ws, "No thanks, pitchref")
-        assert "pre-pitch prompt is still in place" in before, (
-            f"the call did not start in the pre-pitch phase: {before!r}"
+        # The greeting asks "Do you have a quick minute?", so the pitch waits
+        # for an answer. A bare "Hello." is not one: the relay re-asks instead
+        # of pitching (live call CA4ae95 got 23s of pitch for "Hello.").
+        before = await say(ws, "Hello.")
+        from server import (  # noqa: E402
+            OUTBOUND_PITCH,
+            PERMISSION_REASKS,
+            PITCH_MAX_CHARS,
         )
-        from server import OUTBOUND_PITCH, PITCH_MAX_CHARS  # noqa: E402
 
-        pitch = await say(ws, "pitchme")
+        assert before == PERMISSION_REASKS[0], (
+            f"a bare greeting was not re-asked: {before!r}"
+        )
+        pitch = await say(ws, "Yes, go ahead.")
         # Exact text: the mock would return MOCK_REPLIES["pitch"] if the model
         # had generated it, so equality proves the RELAY spoke the pitch.
         assert pitch == OUTBOUND_PITCH, (
@@ -945,7 +950,7 @@ async def check_pitch_phase_ws():
         await ws.send(json.dumps(setup2))
         await asyncio.sleep(0.5)
         await ws.send(
-            json.dumps({"type": "prompt", "voicePrompt": "pitchme", "last": True})
+            json.dumps({"type": "prompt", "voicePrompt": "Yes, go ahead.", "last": True})
         )
         spoken = await speak_until(ws, "30 percent")
         await ws.send(
@@ -977,7 +982,7 @@ async def check_pitch_phase_ws():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup3))
         await asyncio.sleep(0.5)
-        pitch = await say(ws, "pitchme")
+        pitch = await say(ws, "Yes, go ahead.")
         assert pitch == OUTBOUND_PITCH, f"no pitch spoken: {pitch!r}"
     setup3_r = dict(setup3)
     setup3_r["connectionType"] = "reconnect"
@@ -1001,7 +1006,7 @@ async def check_pitch_phase_ws():
         await ws.send(json.dumps(setup4))
         await asyncio.sleep(0.5)
         await ws.send(
-            json.dumps({"type": "prompt", "voicePrompt": "pitchme", "last": True})
+            json.dumps({"type": "prompt", "voicePrompt": "Yes, go ahead.", "last": True})
         )
         await speak_until(ws, "30 percent")
         await ws.send(
@@ -1038,6 +1043,108 @@ async def check_pitch_phase_ws():
     print("PITCH ON DECLINE: pass — a 'no' is not pitched at")
 
 
+async def check_permission_phase_ws():
+    """End-to-end: the pitch waits for an answer to "Do you have a quick
+    minute?".
+
+    Live call CA4ae95: the caller picked up and said "Hello." three seconds
+    after the greeting. The old gate treated every turn that was not a decline
+    as consent, so the relay spoke 264 characters (23 seconds) of pitch before
+    the caller could answer, and the first thing they managed to say was
+    "Uh, no." A greeting is not consent: re-ask, then give up politely.
+    """
+    from server import (  # noqa: E402
+        MAX_PERMISSION_REASKS,
+        OUTBOUND_PITCH,
+        PERMISSION_GIVE_UP_CLOSE,
+        PERMISSION_REASKS,
+    )
+
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async def _session(call_sid, utterances):
+        setup = dict(SETUP)
+        setup["callSid"] = call_sid
+        setup["direction"] = "outbound-api"
+        replies = []
+        async with websockets.connect(WS_URL, max_size=2**20) as ws:
+            await ws.send(json.dumps(setup))
+            await asyncio.sleep(0.5)
+            for utterance in utterances:
+                await ws.send(
+                    json.dumps(
+                        {"type": "prompt", "voicePrompt": utterance, "last": True}
+                    )
+                )
+                replies.append(await _spoken(ws))
+        return replies
+
+    # A1: the CA4ae95 regression. "Hello." is answering the phone, not
+    # consenting, so it must be re-asked — and the pitch must not be spoken.
+    replies = await _session(
+        "CAtest0000000000000000000000000030",
+        ["Hello.", "Yes, sure."],
+    )
+    assert replies[0] == PERMISSION_REASKS[0], (
+        f"a bare greeting was not re-asked: {replies[0]!r}"
+    )
+    assert replies[0] != OUTBOUND_PITCH, "a bare greeting was pitched at"
+    assert replies[1] == OUTBOUND_PITCH, (
+        f"an affirmative answer did not get the pitch: {replies[1]!r}"
+    )
+
+    # A2: a decline retires the phase, and a goodbye after it must not pitch
+    # either. "Yeah, no" carries an affirmative word, so the decline check has
+    # to run first.
+    replies = await _session(
+        "CAtest0000000000000000000000000031",
+        ["Yeah, no.", "Okay, bye."],
+    )
+    for reply in replies:
+        assert reply != OUTBOUND_PITCH, f"a decline was pitched at: {reply!r}"
+        assert reply, "a decline got no reply at all"
+
+    # A3: re-ask exhaustion. Two asks, then a polite close — a caller who has
+    # heard the greeting plus two re-asks is not going to engage, and the
+    # phase must be retired without a pitch.
+    replies = await _session(
+        "CAtest0000000000000000000000000032",
+        ["Hello.", "Who is this?", "Huh?", "pitchref"],
+    )
+    assert MAX_PERMISSION_REASKS == 2, MAX_PERMISSION_REASKS
+    assert replies[0] == PERMISSION_REASKS[0], replies[0]
+    assert replies[1] == PERMISSION_REASKS[1], replies[1]
+    assert replies[2] == PERMISSION_GIVE_UP_CLOSE, (
+        f"the re-ask cap did not close the call: {replies[2]!r}"
+    )
+    # The phase is retired, so the model is on the post-pitch prompt: it
+    # cannot pitch on a later turn even though no pitch was ever spoken.
+    assert "post-pitch prompt is in place" in replies[3], (
+        f"the give-up close left the pitch phase open: {replies[3]!r}"
+    )
+
+    # A4: a name is not consent. Only a volunteered callback number is.
+    replies = await _session(
+        "CAtest0000000000000000000000000033",
+        ["Hello, this is Don."],
+    )
+    assert replies[0] == PERMISSION_REASKS[0], (
+        f"a name was read as consent to pitch: {replies[0]!r}"
+    )
+    print("PERMISSION PHASE: pass — the pitch waits for an answer")
+
+
 async def check_ack_suppression():
     """A cut-in is only worth acknowledging when the caller actually cut off a
     reply, and not when their turn is a bare greeting. Live call CA7d8e6e had
@@ -1063,6 +1170,9 @@ async def check_ack_suppression():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
+        # Answer the greeting's question so the call is past the pitch: the
+        # ack decision is what is under test, not the permission phase.
+        await say(ws, "Yes, go ahead.")
         await say(ws, "Tell me about EPP.")
         # Post-stream interrupt: the reply is done, so the ack decision is made
         # by the speech-kind gate rather than the in-stream branch.
@@ -1286,8 +1396,12 @@ async def check_post_pitch_answer_ws():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
+        # The greeting asks for a minute, so the pitch needs an answer: a bare
+        # "Hello." is re-asked, not pitched at.
         await ws.send(
-            json.dumps({"type": "prompt", "voicePrompt": "Hello.", "last": True})
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "Yes, go ahead.", "last": True}
+            )
         )
         assert await _spoken(ws) == OUTBOUND_PITCH, "the pitch turn did not pitch"
 
@@ -2031,9 +2145,12 @@ async def main():
     # itself. The interrupt truncates the assistant turn to what the caller
     # heard, so it no longer reads as "I already gave the pitch" and a live
     # call re-emitted the same 372-char pitch verbatim on "Hello.".
+    # Inbound, because the outbound first turn is the relay's own pitch or a
+    # permission re-ask rather than a model reply: the note is direction-
+    # agnostic, and this keeps the interrupted reply model-generated.
     setup7 = dict(SETUP)
     setup7["callSid"] = "CAtest0000000000000000000000000006"
-    setup7["direction"] = "outbound-api"
+    setup7["direction"] = "inbound"
     async with websockets.connect(WS_URL, max_size=2**20) as ws7:
         await ws7.send(json.dumps(setup7))
         await asyncio.sleep(0.5)
@@ -2143,6 +2260,7 @@ async def main():
     await check_idle_prompt()
     await check_reconnect_state()
     await check_pitch_phase_ws()
+    await check_permission_phase_ws()
     await check_ack_suppression()
     await check_forbidden_question_ws()
     await check_forbidden_question_late_ws()

@@ -213,6 +213,35 @@ CLOSING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The caller agreed to listen. The outbound greeting asks "Do you have a quick
+# minute?", so the pitch must wait for an actual answer: a live call (CA4ae95)
+# said "Hello." three seconds after the greeting and got 23 seconds of pitch
+# before it could answer. Word-bounded, and only ever consulted AFTER
+# NEGATIVE_RE and CLOSING_RE, so "yeah, no" and "okay, bye" still decline.
+AFFIRMATIVE_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|alright|all right|go ahead|go for it|"
+    r"shoot|certainly|absolutely|of course|please do|sounds good|why not|"
+    r"i do|have a minute|uh huh|mm hmm|mmhmm)\b",
+    re.IGNORECASE,
+)
+
+# The permission phase: the greeting asked for a minute, the caller has not
+# answered yet. Relay-spoken and fixed, like the pitch, so the reply is
+# deterministic and cannot ramble. Two asks, then a polite close — a caller who
+# has heard the greeting plus two re-asks is not going to engage.
+MAX_PERMISSION_REASKS = 2
+PERMISSION_REASKS = (
+    "Sorry — is now an okay time for a quick minute about the Bell employee "
+    "offer?",
+    "It's Cellular Solution's automated assistant calling about Bell's "
+    "Employee Purchase Program. Do you have a quick minute?",
+)
+PERMISSION_GIVE_UP_CLOSE = (
+    "No problem — I'll let you go. You can check your company's eligibility "
+    "anytime at cellular solution dot c a under Employee Offers. Have a good "
+    "day."
+)
+
 # A reply this short with no question leaves the caller with nothing to say.
 # The prompt forbids it ("Never answer with a single word like 'Great' or
 # 'Okay'") but a live call produced "Okay." and "Alright." twice in a row
@@ -298,6 +327,22 @@ def _swap_to_after_pitch(history: list, state: dict, call_sid: str) -> None:
     state["pitch_delivered"] = True
     history[0] = {"role": "system", "content": _after_pitch_prompt()}
     log_event("pitch_delivered", callSid=call_sid)
+
+
+def _retire_pitch_phase(history: list, state: dict) -> None:
+    """Leave the pitch phase WITHOUT delivering the pitch: the caller declined,
+    or never consented to listen.
+
+    Swaps in the post-pitch prompt so the model cannot pitch on a later turn —
+    the pre-pitch prompt still carries the pitch script and the "go straight
+    into the pitch" trigger, so simply skipping the relay pitch would let the
+    model produce an uncontrolled one. `pitch_delivered` and its log event stay
+    reserved for an actual pitch, so this is a separate flag.
+    """
+    if state.get("pitch_skipped"):
+        return
+    state["pitch_skipped"] = True
+    history[0] = {"role": "system", "content": _after_pitch_prompt()}
 
 
 def _gate_commits(partial: str, recent_replies=()) -> bool:
@@ -799,6 +844,11 @@ def new_call_state() -> dict:
         "interrupted": False,
         "recent_replies": [],
         "pitch_delivered": False,
+        # The permission phase: the greeting asked for a minute and the caller
+        # has not answered yet. `pitch_skipped` means the phase is over without
+        # a pitch (declined, or never consented), so the gate stays shut.
+        "permission_reasks": 0,
+        "pitch_skipped": False,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -2165,38 +2215,85 @@ async def relay_ws(websocket: WebSocket) -> None:
                 # caller whose first words are "I'm Don, 416-555-0100" must
                 # still have the callback captured, and the pitch turn used to
                 # `continue` before any of that ran.
+                #
+                # The greeting asks "Do you have a quick minute?", so the pitch
+                # waits for an actual answer. A live call (CA4ae95) said
+                # "Hello." three seconds after the greeting — answering the
+                # phone, not consenting — and got 23 seconds of pitch before it
+                # could say anything. Order matters: a decline is checked first
+                # so "yeah, no" and "okay, bye" still decline, and a caller who
+                # volunteers a callback number on turn one is engaging, so that
+                # counts as consent.
                 if (
                     is_outbound
                     and not state["pitch_delivered"]
-                    and not NEGATIVE_RE.search(user_text)
-                    and not CLOSING_RE.search(user_text)
+                    and not state.get("pitch_skipped")
                 ):
-                    spoken_pitch = _speakable_text(OUTBOUND_PITCH)
-                    # Flag the phase and persist BEFORE speaking: a socket drop
-                    # between the send and the save would restore
-                    # pitch_delivered=False and re-pitch on reconnect.
-                    _swap_to_after_pitch(history, state, call_sid)
-                    save_call_state()
-                    await send_speech(spoken_pitch, True, True, "reply")
-                    # The notice was spoken before the pitch, so it goes into
-                    # history first: the model reads the turn in the order the
-                    # caller heard it.
-                    if notice_to_log:
-                        history.append({"role": "assistant", "content": notice_to_log})
-                    history.append({"role": "assistant", "content": spoken_pitch})
-                    state["recent_replies"].append(spoken_pitch)
-                    del state["recent_replies"][:-RECENT_REPLIES_KEPT]
-                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
-                        del history[1]
-                    log_event(
-                        "pitch_spoken",
-                        callSid=call_sid,
-                        chars=len(spoken_pitch),
-                        est_playback_s=round(
-                            estimate_speech_seconds(spoken_pitch), 1
-                        ),
-                    )
-                    continue
+                    if NEGATIVE_RE.search(user_text) or CLOSING_RE.search(user_text):
+                        # Declined: retire the phase so the model cannot pitch
+                        # on a later turn, then let it close politely.
+                        _retire_pitch_phase(history, state)
+                        save_call_state()
+                    elif AFFIRMATIVE_RE.search(user_text) or state["callback_phone"]:
+                        spoken_pitch = _speakable_text(OUTBOUND_PITCH)
+                        # Flag the phase and persist BEFORE speaking: a socket
+                        # drop between the send and the save would restore
+                        # pitch_delivered=False and re-pitch on reconnect.
+                        _swap_to_after_pitch(history, state, call_sid)
+                        save_call_state()
+                        await send_speech(spoken_pitch, True, True, "reply")
+                        # The notice was spoken before the pitch, so it goes
+                        # into history first: the model reads the turn in the
+                        # order the caller heard it.
+                        if notice_to_log:
+                            history.append(
+                                {"role": "assistant", "content": notice_to_log}
+                            )
+                        history.append(
+                            {"role": "assistant", "content": spoken_pitch}
+                        )
+                        state["recent_replies"].append(spoken_pitch)
+                        del state["recent_replies"][:-RECENT_REPLIES_KEPT]
+                        while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                            del history[1]
+                        log_event(
+                            "pitch_spoken",
+                            callSid=call_sid,
+                            chars=len(spoken_pitch),
+                            est_playback_s=round(
+                                estimate_speech_seconds(spoken_pitch), 1
+                            ),
+                        )
+                        continue
+                    else:
+                        # Permission phase: the caller has not answered the
+                        # greeting's question yet. Re-ask, then close politely.
+                        # Relay-spoken so the reply is deterministic and cannot
+                        # turn into an uncontrolled pitch.
+                        if state["permission_reasks"] < MAX_PERMISSION_REASKS:
+                            line = PERMISSION_REASKS[state["permission_reasks"]]
+                            state["permission_reasks"] += 1
+                            event = "permission_reask"
+                        else:
+                            line = PERMISSION_GIVE_UP_CLOSE
+                            _retire_pitch_phase(history, state)
+                            event = "permission_give_up"
+                        spoken_line = _speakable_text(line)
+                        save_call_state()
+                        await send_speech(spoken_line, True, True, "reply")
+                        if notice_to_log:
+                            history.append(
+                                {"role": "assistant", "content": notice_to_log}
+                            )
+                        history.append(
+                            {"role": "assistant", "content": spoken_line}
+                        )
+                        state["recent_replies"].append(spoken_line)
+                        del state["recent_replies"][:-RECENT_REPLIES_KEPT]
+                        while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                            del history[1]
+                        log_event(event, callSid=call_sid, text=spoken_line)
+                        continue
 
                 # The caller cut the assistant off last turn. The truncated
                 # assistant turn no longer reads as "I already said this", so
@@ -2363,7 +2460,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # comparing against one reply misses the pitch repeat.
                     state["recent_replies"].append(reply.strip())
                     del state["recent_replies"][:-RECENT_REPLIES_KEPT]
-                    if is_outbound and not state["pitch_delivered"] and _pitch_delivered(reply):
+                    if (
+                        is_outbound
+                        and not state["pitch_delivered"]
+                        and not state.get("pitch_skipped")
+                        and _pitch_delivered(reply)
+                    ):
                         # The pitch is now behind us. Swap the system prompt for
                         # one with no pitch script and no "go straight into the
                         # pitch" trigger: the pre-pitch prompt tells the model to
