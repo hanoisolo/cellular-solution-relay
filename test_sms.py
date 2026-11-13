@@ -520,6 +520,85 @@ def main():
         check("repeat fallback is not a sign-off",
               not server.CLOSING_RE.search(fallback), fallback)
 
+    # --- claims_staff_availability(): the relay has no calendar access, so a
+    # reply that says whether a named colleague is available is invented. A
+    # live outbound call (CAdc6292) answered "can you transfer me to Ed?" with
+    # "Ed isn't available right now." ---
+    for claim in (
+        "Ed isn't available right now.",
+        "Ed is not available.",
+        "Ed is unavailable at the moment.",
+        "Neelam is out of the office today.",
+        "Dwayne is with a customer.",
+        "Ed will be back tomorrow.",
+        "Ed is busy right now.",
+        "Neelam isn't at her desk.",
+        "Ed's not in today.",
+        "Ed is on vacation.",
+    ):
+        check(f"claims_staff_availability({claim!r}) -> True",
+              server.claims_staff_availability(claim) is True,
+              repr(server.claims_staff_availability(claim)))
+    for clean in (
+        "",
+        "Would you like the store to call you back?",
+        # A statement about opening hours, not about a person.
+        "The store isn't available right now.",
+        "Our office is closed on weekends.",
+        # A staff name with no availability claim.
+        "Ed can help you with that.",
+        "I can transfer you to Ed.",
+        # The fallbacks themselves must never trip the guard, or it loops.
+        *server.AVAILABILITY_FALLBACKS,
+    ):
+        check(f"claims_staff_availability({clean!r}) -> False",
+              server.claims_staff_availability(clean) is False,
+              repr(server.claims_staff_availability(clean)))
+    # The guard must hold the reply before it is spoken, the same way the
+    # forbidden-question guard does.
+    check("_gate_commits holds a staff-availability claim",
+          server._gate_commits("Ed isn't available right now. Would you like "
+                               "the store to call you back?") is False,
+          "committed")
+    check("_gate_commits lets the availability fallback through",
+          server._gate_commits(server.AVAILABILITY_FALLBACKS[0]) is True,
+          "held")
+    for fallback in server.AVAILABILITY_FALLBACKS:
+        check("availability fallback is an open turn",
+              "?" in fallback, fallback)
+        check("availability fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
+        check("availability fallback does not itself claim availability",
+              server.claims_staff_availability(fallback) is False, fallback)
+    # HANDOFF_PEOPLE drives the guard, so it must stay in step with the
+    # routing table or a renamed colleague silently loses the guard.
+    route_labels = {label for _, label, _ in server.HANDOFF_ROUTES}
+    for person in server.HANDOFF_PEOPLE:
+        check(f"HANDOFF_PEOPLE {person!r} is a route label",
+              person in route_labels, f"{sorted(route_labels)}")
+
+    # --- is_repeat(): a reworded repeat can be the previous reply with a
+    # clause added or dropped. On CAdc6292 the agent asked the callback
+    # question twice, the second time without the "Ed isn't available right
+    # now." opener — ratio 0.844, just under REPEAT_SIMILARITY, and the shared
+    # block (81 chars) under REPEAT_MIN_BLOCK, so neither path fired. ---
+    long_q = ("Would you like the store to call you back about Bell's "
+              "Employee Purchase Program?")
+    check("is_repeat: a reply with a clause added is a repeat",
+          server.is_repeat(long_q, "Ed isn't available right now. " + long_q)
+          is True, "not flagged")
+    check("is_repeat: a reply with a clause dropped is a repeat",
+          server.is_repeat("Ed isn't available right now. " + long_q, long_q)
+          is True, "not flagged")
+    check("is_repeat: containment does not flag a short reply",
+          server.is_repeat("Sure.", "Sure. " + long_q) is False,
+          "a short reply was flagged")
+    check("is_repeat: unrelated long replies are not repeats",
+          server.is_repeat(long_q,
+                           "Bell's Employee Purchase Program gives up to 30 "
+                           "percent off mobility plans with no activation fees.")
+          is False, "unrelated replies flagged")
+
     # --- A closing ends the call: the relay sends action "close" and /handoff
     # must hang up, not dial. Dialling would put a caller who just said goodbye
     # through to a live line. ---

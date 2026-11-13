@@ -1344,6 +1344,96 @@ async def check_forbidden_question_late_ws():
     print("FORBIDDEN QUESTION (late): pass — caught after the commit point")
 
 
+async def check_availability_guard_ws():
+    """End-to-end: a fabricated claim about a colleague's availability must
+    never be spoken. The relay has no calendar access, so "Ed isn't available
+    right now" is invented — a live outbound call (CAdc6292) said exactly that
+    when the caller asked to be transferred to Ed."""
+    from server import AVAILABILITY_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000021"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    # A decline is the one first turn the relay does not pitch
+                    # on, so the model gets the turn and the guard is reached.
+                    "voicePrompt": "No thanks, availref",
+                    "last": True,
+                }
+            )
+        )
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        spoken = "".join(tokens).strip()
+        assert "available" not in spoken.lower(), (
+            f"the fabricated availability claim was spoken: {spoken!r}"
+        )
+        assert spoken in AVAILABILITY_FALLBACKS, (
+            f"expected an availability fallback, got: {spoken!r}"
+        )
+    print("AVAILABILITY GUARD WS: pass — a fabricated claim is replaced")
+
+
+async def check_availability_guard_late_ws():
+    """End-to-end: a claim that arrives AFTER the pre-speech gate has committed
+    must still never be spoken. The gate commits at the first question mark, so
+    "Would you like the store to call you back? Ed isn't available right now."
+    used to stream out unfiltered."""
+    from server import AVAILABILITY_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000022"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, availref_late",
+                    "last": True,
+                }
+            )
+        )
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        spoken = "".join(tokens).strip()
+        assert "available" not in spoken.lower(), (
+            f"the late availability claim was spoken: {spoken!r}"
+        )
+        assert any(f in spoken for f in AVAILABILITY_FALLBACKS), (
+            f"an availability fallback was not substituted: {spoken!r}"
+        )
+        # The subject must not be left dangling before the fallback.
+        assert not spoken.rstrip().endswith("Ed"), (
+            f"the subject was left dangling before the fallback: {spoken!r}"
+        )
+    print("AVAILABILITY GUARD (late): pass — caught after the commit point")
+
+
 async def check_pitch_turn_capture_ws():
     """A caller who volunteers their name and number on the FIRST outbound turn
     must still have the callback captured.
@@ -2593,6 +2683,8 @@ async def main():
     await check_ack_suppression()
     await check_forbidden_question_ws()
     await check_forbidden_question_late_ws()
+    await check_availability_guard_ws()
+    await check_availability_guard_late_ws()
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()

@@ -289,6 +289,32 @@ later real handoff. It is a separate set rather than a `CALL_STATE` key because
 `CALL_STATE` is copied into the handler's state on a reconnect and re-saved
 every turn, which would resurrect the flag.
 
+### The agent never claims to know someone's schedule
+
+The relay has no calendar access, so any reply that says whether a named
+colleague is available is invented. A live outbound call answered "can you
+transfer me to Ed?" with "Ed isn't available right now." — a fabrication about
+a real person, and the kind of thing that makes a caller hang up.
+
+`claims_staff_availability()` requires **both** an availability phrase and one
+of `HANDOFF_PEOPLE` in the same text, so "the store isn't available right now"
+(a statement about opening hours) is left alone. When it fires, the reply is
+replaced with `AVAILABILITY_FALLBACKS` — "I can't check anyone's schedule from
+here, but the store can help — would you like them to call you back?"
+
+It is enforced in two places, the same way the forbidden-question guard is:
+
+- `_gate_commits()` refuses to commit a reply containing the claim, so the
+  pre-speech gate holds it and the whole reply is replaced before anything is
+  spoken.
+- `_availability_at()` scans the not-yet-spoken text before each flush, so a
+  claim that arrives *after* the commit point ("Would you like the store to
+  call you back? Ed isn't available right now.") is still caught. The cut backs
+  up to the start of the sentence, so the caller never hears a dangling "Ed".
+
+`HANDOFF_PEOPLE` is kept in step with the labels in `HANDOFF_ROUTES` by a test,
+so renaming a colleague cannot silently drop the guard.
+
 ## Changing the agent's wording without touching code
 
 All runtime-tunable wording and relay settings are overridable via environment

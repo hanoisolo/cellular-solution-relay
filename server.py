@@ -474,6 +474,11 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
     # reply instead of committing on its question mark.
     if FORBIDDEN_QUESTION_RE.search(t):
         return False
+    # A claim about a colleague's availability is invented — the relay has no
+    # calendar access — so hold the reply the same way. The caller must never
+    # hear it.
+    if claims_staff_availability(t):
+        return False
     # A closing commits at once: holding it to end-of-stream only delays a
     # goodbye, and is_dead_end no longer treats it as a dead end.
     if CLOSING_RE.search(t):
@@ -552,6 +557,83 @@ REPEAT_FALLBACKS = (
     "Sorry, let me start over. What would you like to know?",
 )
 
+# The staff members the store routes by name. Kept in step with the labels in
+# HANDOFF_ROUTES by a test, because the availability guard below keys on them.
+HANDOFF_PEOPLE = ("Neelam", "Dwayne", "Ed")
+
+# A reply that says whether a named colleague is available. The relay has no
+# calendar access, so any such claim is invented. On a live outbound call
+# (CAdc6292) a caller asked to be transferred to Ed and the agent answered
+# "Ed isn't available right now." — a fabrication about a real person, and the
+# kind of thing that makes a caller hang up. Outbound calls never route to a
+# named person by design, so the honest answer is a callback offer.
+AVAILABILITY_CLAIM_RE = re.compile(
+    r"\b(?:isn'?t|is not|is|'s|’s|aren'?t|are not|are|will be|won'?t be)\s+"
+    r"(?:currently\s+|right now\s+)?(?:not\s+)?"
+    r"(?:available|unavailable|in today|in right now|at (?:his|her|their) desk|"
+    r"out of the office|out of town|away|off today|on vacation|on holiday|"
+    r"busy|with (?:a|another) customer|back (?:today|tomorrow|soon|later|"
+    r"next week|on))\b",
+    re.IGNORECASE,
+)
+
+# Spoken instead of the claim. Both end in a question so the dead-end guard
+# leaves them alone, and neither matches CLOSING_RE so a fallback can never
+# end the call.
+AVAILABILITY_FALLBACKS = (
+    "I can't check anyone's schedule from here, but the store can help — "
+    "would you like them to call you back?",
+    "I don't have access to anyone's calendar, but I can have the store reach "
+    "out to you. Would that work?",
+)
+
+
+def claims_staff_availability(reply: str) -> bool:
+    """True when the reply says whether a named colleague is available.
+
+    Requires BOTH an availability phrase and a staff name in the same text:
+    "the store isn't available right now" is a statement about opening hours,
+    not about a person, and must not be replaced.
+    """
+    t = reply or ""
+    if not AVAILABILITY_CLAIM_RE.search(t):
+        return False
+    return any(
+        re.search(rf"\b{re.escape(name)}\b", t, re.IGNORECASE)
+        for name in HANDOFF_PEOPLE
+    )
+
+
+def _availability_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where a staff-availability claim starts, or None.
+
+    Mirrors _forbidden_at: the pre-speech gate only holds a reply until it
+    commits, so a claim that arrives AFTER the commit point ("Would you like
+    the store to call you back? Ed isn't available right now.") would stream
+    out unfiltered. The lookback covers a match that straddles the last flush.
+
+    The cut backs up to the start of the sentence holding the claim, so the
+    subject is not left dangling — otherwise the caller hears "…call you back?
+    Ed" followed by the fallback.
+    """
+    look = 64
+    tail = (spoken or "")[-look:]
+    window = tail + (pending or "")
+    if not claims_staff_availability(window):
+        return None
+    m = AVAILABILITY_CLAIM_RE.search(window)
+    if not m:
+        return None
+    start = m.start()
+    cut = max(
+        window.rfind(". ", 0, start),
+        window.rfind("? ", 0, start),
+        window.rfind("! ", 0, start),
+    )
+    if cut != -1:
+        start = cut + 2
+    return max(0, start - len(tail))
+
 
 def is_repeat(prev: str, cur: str) -> bool:
     """True when the new reply repeats the previous one — verbatim, or, for
@@ -571,6 +653,15 @@ def is_repeat(prev: str, cur: str) -> bool:
         return True
     if len(p) < REPEAT_MIN_CHARS or len(c) < REPEAT_MIN_CHARS:
         return False
+    # A reworded repeat can be the previous reply with a clause added or
+    # dropped. On a live call (CAdc6292) the agent asked the callback question
+    # twice, the second time without the "Ed isn't available right now."
+    # opener: the ratio landed at 0.844, just under REPEAT_SIMILARITY, and the
+    # shared block (81 chars) was under REPEAT_MIN_BLOCK, so neither path
+    # fired. Containment catches it — the shorter reply IS the longer one.
+    # The length gate above keeps this from flagging "Sure." inside a reply.
+    if c in p or p in c:
+        return True
     matcher = difflib.SequenceMatcher(None, p, c)
     if matcher.ratio() >= REPEAT_SIMILARITY:
         return True
@@ -859,6 +950,18 @@ MOCK_REPLIES = {
     # close trigger's false-positive path can be exercised end-to-end. Only
     # reachable in MOCK_LLM mode.
     "takecare": "I can take care of that for you.",
+    # A fabricated claim about a colleague's availability, so the availability
+    # guard can be exercised end-to-end. The claim is the FIRST sentence, so
+    # the pre-speech gate holds it. Only reachable in MOCK_LLM mode.
+    "availref": (
+        "Ed isn't available right now. Would you like the store to call you "
+        "back about Bell's Employee Purchase Program?"
+    ),
+    # The same claim AFTER a sentence that commits the pre-speech gate, so only
+    # the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "availref_late": (
+        "Would you like the store to call you back? Ed isn't available right now."
+    ),
 }
 
 
@@ -904,6 +1007,10 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["gotnumber"]
     if "byeref" in lowered:
         return MOCK_REPLIES["bye"]
+    if "availref_late" in lowered:
+        return MOCK_REPLIES["availref_late"]
+    if "availref" in lowered:
+        return MOCK_REPLIES["availref"]
     if "takecareref" in lowered:
         return MOCK_REPLIES["takecare"]
     if "pitchref" in lowered:
@@ -2105,6 +2212,27 @@ async def relay_ws(websocket: WebSocket) -> None:
                             full = CALLBACK_QUESTION_FALLBACK
                             await _flush(full)
                             break
+                        avail = _availability_at(
+                            spoken_box[0] if spoken_box is not None else "", pending
+                        )
+                        if avail is not None:
+                            # A claim about a colleague's availability is about
+                            # to be spoken. Same treatment: say the safe prefix,
+                            # then the fallback, and drop the rest of the
+                            # stream — the relay has no calendar access, so the
+                            # claim is invented.
+                            safe = pending[:avail]
+                            pending = ""
+                            if safe:
+                                await _flush(safe)
+                            log_event(
+                                "availability_guard",
+                                callSid=call_sid,
+                                text=full.strip(),
+                            )
+                            full = AVAILABILITY_FALLBACKS[0]
+                            await _flush(full)
+                            break
                         emit, pending = _split_pending(pending)
                         await _flush(emit)
                 token = await _next_token()
@@ -2118,7 +2246,16 @@ async def relay_ws(websocket: WebSocket) -> None:
             repeated = next(
                 (r for r in recent_replies if is_repeat(r, gate)), None
             )
-            if FORBIDDEN_QUESTION_RE.search(gate):
+            if claims_staff_availability(gate):
+                log_event(
+                    "availability_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = AVAILABILITY_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = AVAILABILITY_FALLBACKS[1]
+            elif FORBIDDEN_QUESTION_RE.search(gate):
                 log_event(
                     "forbidden_question_guard", callSid=call_sid, text=gate.strip()
                 )
