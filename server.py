@@ -213,6 +213,94 @@ CLOSING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The ASSISTANT said goodbye, so the call is over. Deliberately narrower than
+# CLOSING_RE: that one also matches caller-side phrases ("no thanks", "that's
+# all") which the agent can use mid-conversation without meaning the call is
+# finished. A reply that ends in a question is never a closing, however it is
+# worded — "anything else before I let you go?" is still an open turn.
+#
+# The sign-off must also be the whole final clause, not a phrase inside one.
+# "I can take care of that for you." contains "take care" and "Bye for now, the
+# store will call you." contains "bye", but neither ends the conversation, and
+# hanging up on them would cut a live caller off mid-sentence.
+AGENT_CLOSING_RE = re.compile(
+    r"(?:goodbye|good bye|bye bye|bye for now|bye|good night|"
+    r"have a (?:good|great|nice|wonderful) (?:day|one|evening|night|afternoon|"
+    r"morning|weekend|week)|"
+    r"have a (?:good|great|nice|wonderful) rest of your (?:day|evening)|"
+    r"enjoy (?:the rest of )?your (?:day|evening|weekend)|"
+    r"take care(?: of yourself)?|"
+    r"talk to you (?:later|soon|tomorrow)|"
+    r"(?:thanks|thank you) for (?:calling|your time)(?: cellular solution)?"
+    r"(?: today)?|"
+    r"i'?ll let you go)"
+)
+
+# A sign-off can carry a short lead-in: "Okay, goodbye." / "Perfect. Take care."
+# Applied repeatedly, so "Thank you and have a good day." reduces to the
+# sign-off. Em dashes count as separators: "Okay — goodbye."
+AGENT_CLOSING_LEADIN_RE = re.compile(
+    r"^(?:okay|ok|alright|all right|well|so|and|great|perfect|lovely|thanks|"
+    r"thank you|you're welcome|no problem|sure|absolutely|got it|understood)"
+    r"[,!.—–\- ]+"
+)
+
+# "Have a good day, Jonathan." — the model addresses the caller by name, so the
+# sign-off is not the last comma clause. The tail must be CAPITALIZED, and is
+# stripped before lowercasing: a lowercase tail is content, not a name, so
+# "Thanks for calling, go ahead." keeps its clause and does not hang up. Only a
+# one- or two-word tail is stripped, so "Bye for now, the store will call you."
+# keeps its content too.
+_TRAILING_VOCATIVE_RE = re.compile(r",\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?$")
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def is_agent_closing(reply: str) -> bool:
+    """True when the assistant's reply signs off, so the call should end.
+
+    A live call (CA36b78) said "Goodbye." five times in a row: the caller
+    answered "Goodbye.", the agent answered "Goodbye." again, and the call only
+    ended when the caller hung up. Nothing ended the session on a sign-off.
+    """
+    t = (reply or "").strip()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return False
+    # Curly apostrophes come back from the model as often as straight ones.
+    t = t.replace("\u2019", "'")
+    # Only the last sentence can sign off: everything before it is content the
+    # caller still needs to hear.
+    last = _SENTENCE_SPLIT_RE.split(t)[-1].strip().strip(".!…,;: ")
+    # Readings of that sentence, most specific first: the whole thing ("Okay,
+    # goodbye."), its last comma clause ("...solution, goodbye."), the sentence
+    # without a trailing name ("Have a good day, Jonathan."), that sentence's
+    # last comma clause ("...solution, goodbye, Don."), and the tail after a
+    # comma-less "and" ("Thanks for your time and have a good day."). A sign-off
+    # has to match one of them whole, so a phrase inside a longer clause ("I can
+    # take care of that for you.") never counts.
+    candidates = [last, last.split(",")[-1], last.split(" and ")[-1]]
+    without_vocative = _TRAILING_VOCATIVE_RE.sub("", last)
+    if without_vocative != last:
+        candidates.append(without_vocative)
+        candidates.append(without_vocative.split(",")[-1])
+        candidates.append(without_vocative.split(" and ")[-1])
+    for candidate in candidates:
+        c = candidate.strip().strip(".!…,;: ").lower()
+        if AGENT_CLOSING_RE.fullmatch(c):
+            return True
+        # Strip lead-ins repeatedly: "Thank you and have a good day." needs two
+        # passes ("thank you " then "and ") to reach the sign-off.
+        while True:
+            stripped = AGENT_CLOSING_LEADIN_RE.sub("", c)
+            if stripped == c:
+                break
+            c = stripped
+            if AGENT_CLOSING_RE.fullmatch(c):
+                return True
+    return False
+
 # The caller agreed to listen. The outbound greeting asks "Do you have a quick
 # minute?", so the pitch must wait for an actual answer: a live call (CA4ae95)
 # said "Hello." three seconds after the greeting and got 23 seconds of pitch
@@ -738,6 +826,10 @@ MOCK_REPLIES = {
     # A bare sign-off, so the closing exemption in the repeat guard can be
     # exercised end-to-end. Only reachable in MOCK_LLM mode.
     "bye": "Goodbye.",
+    # A normal reply that CONTAINS sign-off vocabulary without being one, so the
+    # close trigger's false-positive path can be exercised end-to-end. Only
+    # reachable in MOCK_LLM mode.
+    "takecare": "I can take care of that for you.",
 }
 
 
@@ -783,6 +875,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["gotnumber"]
     if "byeref" in lowered:
         return MOCK_REPLIES["bye"]
+    if "takecareref" in lowered:
+        return MOCK_REPLIES["takecare"]
     if "pitchref" in lowered:
         swapped = any(
             m.get("role") == "system"
@@ -825,6 +919,15 @@ SESSIONS: dict[str, list[dict]] = {}
 # handoff payload with no callback), and an outbound call could repeat the
 # recording notice. Kept beside SESSIONS and restored on reconnect.
 CALL_STATE: dict[str, dict] = {}
+
+# Calls whose relay session is ending because the agent signed off. Kept apart
+# from CALL_STATE on purpose: CALL_STATE is copied into the handler's `state`
+# on a reconnect and re-saved every turn, so a flag stored there would be
+# resurrected on every later turn and could suppress a real handoff. This set
+# is written before the goodbye finishes playing and discarded when read, so a
+# socket drop mid-goodbye hangs up instead of dialling the store, and nothing
+# else is affected.
+CLOSE_PENDING: set[str] = set()
 MAX_SESSIONS = 100
 
 
@@ -1416,6 +1519,11 @@ async def handoff_action(request: Request) -> Response:
             return Response(content="Forbidden", status_code=403)
     handoff_data = (params.get("HandoffData") or "").strip()
     call_status = (params.get("CallStatus") or "").strip().lower()
+    # Take the close intent here, before any early return: every path through
+    # this endpoint ends the call, so leaving the entry behind would leak a
+    # CallSid and could hang up a later call that reused it.
+    close_pending = params.get("CallSid", "") in CLOSE_PENDING
+    CLOSE_PENDING.discard(params.get("CallSid", ""))
     log_event(
         "handoff_action",
         callSid=params.get("CallSid", ""),
@@ -1434,6 +1542,38 @@ async def handoff_action(request: Request) -> Response:
             callStatus=call_status,
         )
         return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
+    # Parse once: the reason decides whether to dial at all, and the route
+    # decides where. Both ride in the same HandoffData JSON.
+    parsed = {}
+    if handoff_data:
+        try:
+            parsed = json.loads(handoff_data)
+        except ValueError:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+    # The agent signed off, so the conversation is over. Hanging up is the
+    # whole point: dialling the store would put a caller who just said goodbye
+    # through to a live line, and the caller would hear the store answer a call
+    # they had already ended. Keyed on `action`, not `reason`: every close
+    # reason must hang up, and a new reason must not silently start dialling.
+    if str(parsed.get("action") or "") == "close":
+        log_event(
+            "handoff_skipped_closed",
+            callSid=params.get("CallSid", ""),
+            reason=parsed.get("reason"),
+        )
+        return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
+    # A socket drop during the goodbye leaves HandoffData empty. The relay
+    # records the close intent before waiting out playback, so the store is not
+    # dialled for a caller who was being hung up on.
+    if not parsed and close_pending:
+        log_event(
+            "handoff_skipped_closed",
+            callSid=params.get("CallSid", ""),
+            reason="socket-dropped",
+        )
+        return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
     store = os.environ.get("RELAY_STORE_NUMBER", "").strip() or "+19052642228"
     # The relay chose an extension for this caller (a named staff member, the
     # accounts desk, or the EPP desk by default). It arrives as JSON in
@@ -1442,18 +1582,12 @@ async def handoff_action(request: Request) -> Response:
     # malformed or hostile payload can never inject markup or dial digits.
     extension = ""
     label = ""
-    if handoff_data:
-        try:
-            parsed = json.loads(handoff_data)
-        except ValueError:
-            parsed = {}
-        if isinstance(parsed, dict):
-            route = parsed.get("route")
-            if isinstance(route, dict):
-                candidate = str(route.get("extension") or "").strip()
-                if candidate.isdigit() and 1 <= len(candidate) <= 6:
-                    extension = candidate
-                    label = str(route.get("label") or "").strip()[:40]
+    route = parsed.get("route")
+    if isinstance(route, dict):
+        candidate = str(route.get("extension") or "").strip()
+        if candidate.isdigit() and 1 <= len(candidate) <= 6:
+            extension = candidate
+            label = str(route.get("label") or "").strip()[:40]
     if extension:
         number = (
             f'<Number sendDigits="{HANDOFF_DIGIT_PAUSE}{extension}">'
@@ -1664,6 +1798,14 @@ async def relay_ws(websocket: WebSocket) -> None:
     # When the caller will stop hearing the agent, estimated from the text
     # sent. The idle timer counts from here, not from send-complete.
     agent_speaking_until = 0.0
+    # A message that arrived while the relay was waiting out playback. The main
+    # loop must see it, so it is buffered rather than dropped.
+    pending_message: dict | None = None
+    # A receive that is already in flight. The websockets library forbids two
+    # concurrent receives, so a receive started by wait_out_playback() is
+    # handed to the main loop instead of being cancelled or abandoned: an
+    # abandoned receive would swallow the next message and drop it.
+    pending_recv: asyncio.Future | None = None
     speech_buffer = ""
     # What was last spoken: "reply", "idle", "ack", "notice", "opening",
     # "nudge" or "error". The interrupt acknowledgement only makes sense after
@@ -1703,6 +1845,25 @@ async def relay_ws(websocket: WebSocket) -> None:
         it. Called after every turn that can change it."""
         if call_sid:
             CALL_STATE[call_sid] = dict(state)
+
+    async def do_close(reason: str = "caller-closed") -> None:
+        """End the session because the conversation is over, not because the
+        caller wants a person.
+
+        /handoff is the action URL for both cases, so `action` is what tells
+        them apart: it returns empty TwiML for a close, which hangs the call
+        up. Dialling the store here would put a caller who just said goodbye
+        through to a live line.
+        """
+        log_event("session_close", callSid=call_sid, reason=reason)
+        await websocket.send_json(
+            {
+                "type": "end",
+                "handoffData": json.dumps(
+                    {"action": "close", "reason": reason, "callSid": call_sid}
+                ),
+            }
+        )
 
     async def do_handoff(
         reason: str,
@@ -1933,6 +2094,50 @@ async def relay_ws(websocket: WebSocket) -> None:
         est_playback_s = await send_speech("", True, True, "reply")
         return full, est_playback_s
 
+    def recv_future() -> asyncio.Future:
+        """The one in-flight receive, started on first use.
+
+        Shared by wait_out_playback() and next_message() so a receive that
+        outlives a timed wait is reused rather than abandoned.
+        """
+        nonlocal pending_recv
+        if pending_recv is None:
+            pending_recv = asyncio.ensure_future(websocket.receive_json())
+        return pending_recv
+
+    def take(fut: asyncio.Future) -> dict:
+        """Consume a completed receive and forget it, so it is never awaited
+        twice."""
+        nonlocal pending_recv
+        if pending_recv is fut:
+            pending_recv = None
+        return fut.result()
+
+    async def wait_out_playback() -> dict | None:
+        """Wait for the agent's audio to finish, without ignoring the caller.
+
+        The tokens are already sent, so ending the session immediately would
+        cut a goodbye off mid-word. A blind sleep would also ignore a barge-in:
+        the caller says "wait, one more thing" during the sign-off and the
+        relay hangs up anyway. Any message that arrives during the wait is
+        buffered for the main loop and returned, so the caller can decide
+        whether the close still applies.
+
+        On timeout the receive is left in flight for next_message() rather than
+        cancelled: asyncio.wait does not cancel, and an abandoned receive would
+        swallow the next message and drop it.
+        """
+        nonlocal pending_message
+        remaining = max(0.0, agent_speaking_until - time.monotonic())
+        if remaining <= 0:
+            return None
+        recv = recv_future()
+        done, _pending = await asyncio.wait({recv}, timeout=remaining)
+        if not done:
+            return None
+        pending_message = take(recv)
+        return pending_message
+
     async def next_message() -> dict:
         """Receive the next Twilio message, speaking the idle prompt if the
         caller has gone quiet.
@@ -1944,11 +2149,16 @@ async def relay_ws(websocket: WebSocket) -> None:
         once: before that the opening is still playing and a prompt would talk
         over it.
         """
-        nonlocal idle_prompts
+        nonlocal idle_prompts, pending_message
+        if pending_message is not None:
+            message, pending_message = pending_message, None
+            return message
         idle_after = float(os.environ.get("RELAY_IDLE_AFTER", "8") or 0)
         if idle_after <= 0 or not caller_spoke or idle_prompts >= IDLE_PROMPTS_MAX:
-            return await websocket.receive_json()
-        recv = asyncio.ensure_future(websocket.receive_json())
+            recv = recv_future()
+            await recv
+            return take(recv)
+        recv = recv_future()
         while True:
             # Count from when the caller stops HEARING the agent, not from when
             # the text was sent: a 505-char pitch needs ~39s of audio, and the
@@ -1957,7 +2167,7 @@ async def relay_ws(websocket: WebSocket) -> None:
             wait = idle_after + max(0.0, agent_speaking_until - time.monotonic())
             done, _pending = await asyncio.wait({recv}, timeout=wait)
             if done:
-                return recv.result()
+                return take(recv)
             idle_prompts += 1
             if idle_prompts == 1:
                 text = os.environ.get("RELAY_IDLE_TEXT", "") or IDLE_TEXT
@@ -1967,7 +2177,8 @@ async def relay_ws(websocket: WebSocket) -> None:
             log_event("idle_prompt", callSid=call_sid, text=text, n=idle_prompts)
             if idle_prompts >= IDLE_PROMPTS_MAX:
                 # Out of prompts: wait for the caller with no timer running.
-                return await recv
+                await recv
+                return take(recv)
 
     try:
         while True:
@@ -1977,6 +2188,10 @@ async def relay_ws(websocket: WebSocket) -> None:
             if msg_type == "setup":
                 call_sid = message.get("callSid", "")
                 connection_type = message.get("connectionType", "initial")
+                # A reconnect means the call is still up, so any close intent
+                # recorded before the drop is stale: without this, a later drop
+                # on the live call would hang up instead of dialling the store.
+                CLOSE_PENDING.discard(call_sid)
                 is_outbound = str(message.get("direction", "")).startswith("outbound")
                 if is_outbound:
                     greeting = _env_or("RELAY_OUTBOUND_GREETING", OUTBOUND_GREETING)
@@ -2403,6 +2618,28 @@ async def relay_ws(websocket: WebSocket) -> None:
                         while len(history) > 1 + MAX_HISTORY_MESSAGES:
                             del history[1]
                         log_event(event, callSid=call_sid, text=spoken_line)
+                        if event == "permission_give_up":
+                            # The line ends with "Have a good day." — the call
+                            # is over, so close it instead of leaving the
+                            # session open for idle prompts on a caller who
+                            # never agreed to talk.
+                            if call_sid:
+                                CLOSE_PENDING.add(call_sid)
+                            barged = await wait_out_playback()
+                            if barged is not None and barged.get("type") in (
+                                "interrupt",
+                                "dtmf",
+                                "prompt",
+                            ):
+                                CLOSE_PENDING.discard(call_sid)
+                                log_event(
+                                    "close_aborted",
+                                    callSid=call_sid,
+                                    type=barged.get("type"),
+                                )
+                                continue
+                            await do_close("permission-give-up")
+                            return
                         continue
 
                 # The caller cut the assistant off last turn. The truncated
@@ -2646,6 +2883,39 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # The reply may have set the callback-offered / name-owed
                     # flags; persist them for a reconnect.
                     save_call_state()
+                    # The agent signed off, so the call is over. Wait out the
+                    # playback estimate first: the tokens are already sent, and
+                    # ending the session immediately would cut the goodbye off
+                    # mid-word. A live call (CA36b78) said "Goodbye." five times
+                    # because nothing ended the session on a sign-off.
+                    if is_agent_closing(reply):
+                        # Record the intent before the wait: if the socket drops
+                        # mid-goodbye, Twilio posts /handoff with no
+                        # HandoffData, and without this the store would be
+                        # dialled for a caller who was being hung up on.
+                        if call_sid:
+                            CLOSE_PENDING.add(call_sid)
+                        barged = await wait_out_playback()
+                        if barged is not None and barged.get("type") in (
+                            "interrupt",
+                            "dtmf",
+                            "prompt",
+                        ):
+                            # The caller is still talking, or pressed a key, or
+                            # said something new: the sign-off did not end the
+                            # conversation. The message is buffered, so the main
+                            # loop handles it on the next pass. The close intent
+                            # is withdrawn, or a later socket drop would hang up
+                            # a call that is still going.
+                            CLOSE_PENDING.discard(call_sid)
+                            log_event(
+                                "close_aborted",
+                                callSid=call_sid,
+                                type=barged.get("type"),
+                            )
+                            continue
+                        await do_close()
+                        return
 
             elif msg_type == "interrupt":
                 if llm_task is not None and not llm_task.done():
@@ -2708,6 +2978,20 @@ async def relay_ws(websocket: WebSocket) -> None:
             await websocket.close(code=1011)
         except Exception:  # noqa: BLE001, S110 - socket may already be gone
             pass
+    finally:
+        # A receive left in flight by wait_out_playback() would otherwise be
+        # garbage-collected with its exception unretrieved, logging a spurious
+        # "Task exception was never retrieved" on every normal close. Always
+        # await it, even when it is already done: a peer that closed the socket
+        # while do_close() was yielding leaves a completed future holding an
+        # unretrieved WebSocketDisconnect.
+        if pending_recv is not None:
+            if not pending_recv.done():
+                pending_recv.cancel()
+            try:
+                await pending_recv
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

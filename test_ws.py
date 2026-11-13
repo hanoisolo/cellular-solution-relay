@@ -177,7 +177,13 @@ def check_dead_end_guard():
 
 def check_repeat_guard():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from server import is_repeat, REPEAT_FALLBACKS, OUTBOUND_SYSTEM_PROMPT, SYSTEM_PROMPT
+    from server import (
+        is_repeat,
+        REPEAT_FALLBACKS,
+        OUTBOUND_SYSTEM_PROMPT,
+        SYSTEM_PROMPT,
+        CLOSING_RE,
+    )
 
     assert is_repeat("Do you have a minute?", "Do you have a minute?")
     assert is_repeat("Do you  have a minute?", "do you have a minute?")
@@ -271,6 +277,22 @@ def check_repeat_guard():
     # The guard must not answer a loop with a loop of its own.
     assert len(REPEAT_FALLBACKS) == 2, REPEAT_FALLBACKS
     assert REPEAT_FALLBACKS[0] != REPEAT_FALLBACKS[1], REPEAT_FALLBACKS
+
+    # The closing exemption in the reply path is load-bearing: a sign-off IS a
+    # repeat, so without the CLOSING_RE branch the guard would replace
+    # "Goodbye." with "Sorry, I didn't catch that" — the CA2e04 defect. The
+    # 3-turn WS loop that used to cover this is gone (the first sign-off now
+    # ends the session), so assert the precondition directly: the reply is a
+    # repeat AND the exemption fires on it.
+    assert is_repeat("Goodbye.", "Goodbye."), (
+        "a sign-off is not detected as a repeat, so the exemption is untested"
+    )
+    assert CLOSING_RE.search("Goodbye."), (
+        "the closing exemption would not fire on a sign-off"
+    )
+    assert not CLOSING_RE.search("I can take care of that for you."), (
+        "the closing exemption fires on an ordinary reply"
+    )
 
     # The prompt has to stop the loop at the source too: the guard only
     # rewrites a reply after the model has already produced it. The pitch is
@@ -1768,12 +1790,19 @@ async def check_callback_done_note_ws():
 
 
 async def check_closing_repeat_ws():
-    """End-to-end: a repeated sign-off must be spoken, not replaced.
+    """End-to-end: a repeated sign-off is spoken verbatim, then ends the call.
 
     A live call (CA2e04) said "Goodbye." and then answered the caller's next
     "Goodbye." with "Sorry, I didn't catch that" — four times in a row, while
     the caller was trying to hang up. A sign-off is not content the caller has
-    to hear only once, so the repeat guard must let it through.
+    to hear only once, so the repeat guard must let it through. A later live
+    call (CA36b78) then said "Goodbye." five times because nothing ended the
+    session on a sign-off, so the same turn must also close the call.
+
+    The second sign-off is reached by barging in during the first goodbye: that
+    aborts the close, so the session is still up and the repeat guard sees a
+    genuine repeat. Without the CLOSING_RE exemption the guard would replace it
+    with a fallback, which is the CA2e04 defect.
     """
     from server import MOCK_REPLIES, REPEAT_FALLBACKS  # noqa: E402
 
@@ -1783,6 +1812,11 @@ async def check_closing_repeat_ws():
         while asyncio.get_event_loop().time() < deadline:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             m = json.loads(raw)
+            if m.get("type") == "end":
+                raise AssertionError(
+                    f"the session ended before the second sign-off: "
+                    f"{m.get('handoffData')!r}"
+                )
             if m.get("type") != "text" or m.get("interruptible") is False:
                 continue
             tokens.append(m.get("token") or "")
@@ -1796,18 +1830,166 @@ async def check_closing_repeat_ws():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "byeref", "last": True})
+        )
+        spoken = await _spoken(ws)
+        assert spoken == MOCK_REPLIES["bye"], (
+            f"a repeated sign-off was replaced: {spoken!r}"
+        )
+        assert spoken not in REPEAT_FALLBACKS, spoken
+        # Cut in during the goodbye so the close is aborted and the session
+        # stays up for a second sign-off.
+        await ws.send(
+            json.dumps({"type": "interrupt", "utteranceUntilInterrupt": "Wait"})
+        )
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "byeref", "last": True})
+        )
+        # The interrupt acknowledgement ("Sure.") is spoken before the answer,
+        # so read utterances until the sign-off arrives.
+        second = ""
         for _ in range(3):
+            try:
+                second = await _spoken(ws)
+            except asyncio.TimeoutError:
+                break
+            if second == MOCK_REPLIES["bye"]:
+                break
+        assert second == MOCK_REPLIES["bye"], (
+            "the repeat guard replaced a repeated sign-off: "
+            f"{second!r} (expected {MOCK_REPLIES['bye']!r})"
+        )
+        assert second not in REPEAT_FALLBACKS, second
+        # The goodbye is the last thing the caller hears: the session ends
+        # right after it, with an action that tells /handoff to hang up rather
+        # than dial the store.
+        deadline = asyncio.get_event_loop().time() + 15
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+            m = json.loads(raw)
+            if m.get("type") != "end":
+                continue
+            hd = json.loads(m.get("handoffData") or "{}")
+            assert hd.get("action") == "close", (
+                f"a sign-off ended the session without action=close: {hd!r}"
+            )
+            assert hd.get("reason") == "caller-closed", (
+                f"a sign-off ended the session with reason {hd.get('reason')!r}"
+            )
+            assert "route" not in hd, (
+                f"a sign-off carried a handoff route: {hd!r}"
+            )
+            break
+        else:
+            raise AssertionError("the session did not end after the sign-off")
+    print("CLOSING REPEAT: pass — a repeated sign-off is spoken, then ends the call")
+
+
+async def check_no_close_on_normal_reply_ws():
+    """End-to-end: an ordinary reply must not end the call.
+
+    The close trigger reads the model's own words, so a false positive hangs up
+    on a live caller mid-conversation. "I can take care of that for you." is a
+    normal reply that contains "take care" and does not end in a question — the
+    exact shape that would slip past a phrase-level match.
+    """
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") == "end":
+                raise AssertionError(
+                    f"an ordinary reply ended the session: {m.get('handoffData')!r}"
+                )
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000028"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        # Two ordinary turns: the first proves the trigger does not fire on a
+        # reply that merely contains sign-off vocabulary, the second proves the
+        # session is still usable after it.
+        for utterance in ("takecareref", "what is the EPP discount"):
             await ws.send(
                 json.dumps(
-                    {"type": "prompt", "voicePrompt": "byeref", "last": True}
+                    {"type": "prompt", "voicePrompt": utterance, "last": True}
                 )
             )
             spoken = await _spoken(ws)
-            assert spoken == MOCK_REPLIES["bye"], (
-                f"a repeated sign-off was replaced: {spoken!r}"
+            assert spoken, f"no reply to {utterance!r}"
+    print("NO CLOSE ON NORMAL REPLY: pass — only a sign-off ends the call")
+
+
+async def check_close_aborted_on_barge_in_ws():
+    """End-to-end: a caller who cuts in during the goodbye is not hung up on.
+
+    The sign-off is spoken, then the relay waits out the playback estimate
+    before ending the session. A blind sleep would ignore a barge-in: the
+    caller says "wait, one more thing" during the goodbye and the relay hangs
+    up anyway. The message that arrives during the wait must be buffered and
+    handled, not dropped.
+    """
+    from server import MOCK_REPLIES  # noqa: E402
+
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") == "end":
+                raise AssertionError(
+                    "a barge-in during the goodbye still ended the session: "
+                    f"{m.get('handoffData')!r}"
+                )
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000029"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "byeref", "last": True})
+        )
+        spoken = await _spoken(ws)
+        assert spoken == MOCK_REPLIES["bye"], spoken
+        # Cut in while the goodbye is still playing.
+        await ws.send(
+            json.dumps(
+                {"type": "interrupt", "utteranceUntilInterrupt": "Wait"}
             )
-            assert spoken not in REPEAT_FALLBACKS, spoken
-    print("CLOSING REPEAT: pass — a sign-off is never replaced")
+        )
+        # The session must still be alive: a follow-up turn gets an answer.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "what is the EPP discount",
+                    "last": True,
+                }
+            )
+        )
+        reply = await _spoken(ws)
+        assert reply, "the session stopped answering after a barge-in"
+    print("CLOSE ABORTED ON BARGE-IN: pass — a cut-in during the goodbye keeps the call up")
 
 
 async def check_handoff_routing_ws():
@@ -2377,6 +2559,8 @@ async def main():
     await check_name_escape_hatch_ws()
     await check_callback_done_note_ws()
     await check_closing_repeat_ws()
+    await check_no_close_on_normal_reply_ws()
+    await check_close_aborted_on_barge_in_ws()
     await check_handoff_routing_ws()
     print("\nALL TESTS PASSED")
 

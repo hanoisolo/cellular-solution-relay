@@ -416,6 +416,156 @@ def main():
           extensions == {"226", "232", "231", "220"},
           f"{sorted(extensions)}")
 
+    # --- A closing ends the call: the relay sends action "close" and /handoff
+    # must hang up, not dial. Dialling would put a caller who just said goodbye
+    # through to a live line. ---
+    for status in ("in-progress", "completed", ""):
+        payload = {"CallSid": "CA123", "HandoffData": json.dumps(
+            {"action": "close", "reason": "caller-closed", "callSid": "CA123"})}
+        if status:
+            payload["CallStatus"] = status
+        r = post_signed("/handoff", payload, "tok-123")
+        root = ET.fromstring(r.content)
+        check(f"POST /handoff action=close (CallStatus={status or 'absent'}) -> no Dial",
+              r.status_code == 200 and root.find("./Dial") is None
+              and root.find("./Say") is None,
+              f"{r.status_code} {r.text[:200]}")
+    # Every close reason hangs up, not just the caller-closed one: keying on
+    # `reason` would start dialling the store the moment a new close reason is
+    # added (the outbound permission give-up is one).
+    for reason in ("caller-closed", "permission-give-up", "some-future-reason"):
+        r = post_signed("/handoff",
+                        {"CallSid": "CA123", "HandoffData": json.dumps(
+                            {"action": "close", "reason": reason})},
+                        "tok-123")
+        root = ET.fromstring(r.content)
+        check(f"POST /handoff action=close reason={reason} -> no Dial",
+              r.status_code == 200 and root.find("./Dial") is None,
+              f"{r.status_code} {r.text[:200]}")
+    # A close wins over a route: the caller is leaving, so the destination is
+    # irrelevant and must not be dialled.
+    r = post_signed("/handoff",
+                    {"CallSid": "CA123", "HandoffData": json.dumps(
+                        {"action": "close", "reason": "caller-closed",
+                         "route": {"extension": "226", "label": "Neelam"}})},
+                    "tok-123")
+    root = ET.fromstring(r.content)
+    check("POST /handoff action=close with a route -> still no Dial",
+          r.status_code == 200 and root.find("./Dial") is None,
+          f"{r.status_code} {r.text[:200]}")
+    # Any other reason still dials: the close must not swallow a real handoff.
+    r = post_signed("/handoff",
+                    {"CallSid": "CA123", "HandoffData": json.dumps(
+                        {"reason": "caller-requested-human"})},
+                    "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff caller-requested-human -> still dials",
+          r.status_code == 200 and dial is not None and dial.text == "+19052642228",
+          f"{r.status_code} {r.text[:200]}")
+    # A socket drop during the goodbye posts /handoff with no HandoffData at
+    # all. The relay records the close intent first, so the store is not
+    # dialled for a caller who was being hung up on.
+    server.CLOSE_PENDING.add("CAdropclose")
+    r = post_signed("/handoff", {"CallSid": "CAdropclose"}, "tok-123")
+    root = ET.fromstring(r.content)
+    check("POST /handoff after a socket drop mid-goodbye -> no Dial",
+          r.status_code == 200 and root.find("./Dial") is None,
+          f"{r.status_code} {r.text[:200]}")
+    # Discarded, not read: the flag must not suppress a later real handoff.
+    r = post_signed("/handoff",
+                    {"CallSid": "CAdropclose", "HandoffData": json.dumps(
+                        {"reason": "caller-requested-human"})},
+                    "tok-123")
+    dial = ET.fromstring(r.content).find("./Dial/Number")
+    check("POST /handoff: a consumed close flag does not suppress a real handoff",
+          r.status_code == 200 and dial is not None,
+          f"{r.status_code} {r.text[:200]}")
+    # A normal close must clear the flag too, or a later drop on the same call
+    # would hang up a call that is still going.
+    server.CLOSE_PENDING.add("CAcloseclear")
+    r = post_signed("/handoff",
+                    {"CallSid": "CAcloseclear", "HandoffData": json.dumps(
+                        {"action": "close", "reason": "caller-closed"})},
+                    "tok-123")
+    check("POST /handoff action=close clears the close intent",
+          "CAcloseclear" not in server.CLOSE_PENDING,
+          f"CLOSE_PENDING still holds CAcloseclear: {server.CLOSE_PENDING}")
+    server.CLOSE_PENDING.discard("CAdropclose")
+
+    # --- is_agent_closing(): the assistant signed off, so the call is over. ---
+    for reply in (
+        "Goodbye.",
+        "The store will call you back at (416) 522-3344. Goodbye.",
+        "You're welcome. Have a good day.",
+        "Thanks for calling Cellular Solution. Take care.",
+        "Perfect. Talk to you later.",
+        "Okay, goodbye.",
+        "Okay — goodbye.",
+        "Thanks for calling Cellular Solution, goodbye.",
+        "Take care of yourself.",
+        "Goodbye!",
+        # The lead-in must not eat the sign-off: "thanks for calling" is itself
+        # a closing, and the lead-in list contains "thanks".
+        "Thanks for calling.",
+        "Thank you for calling Cellular Solution.",
+        # A trailing name is a vocative, not content.
+        "Have a good day, Jonathan.",
+        "Goodbye, Don.",
+        # Compound lead-ins and the outbound decline closings.
+        "Thanks for your time, and have a good day.",
+        "Thank you and have a good day.",
+        "Have a good afternoon.",
+        "Have a great weekend.",
+        "Have a wonderful day.",
+        "Have a great rest of your day.",
+        "Bye for now.",
+        "Thanks for your time.",
+        "No problem, I'll let you go.",
+        # A name after the sign-off, and a comma-less "and" compound.
+        "Thanks for calling Cellular Solution, goodbye, Don.",
+        "Sorry to bother you, have a good day, Jonathan.",
+        "Thanks for your time and have a good day.",
+        "Thanks for your time and have a good day, Jonathan.",
+        "Thanks for calling today.",
+        "Enjoy your day.",
+        "Enjoy the rest of your day.",
+        "Have a great week.",
+        # The model emits curly apostrophes as often as straight ones.
+        "I\u2019ll let you go.",
+    ):
+        check(f"is_agent_closing({reply!r}) -> True",
+              server.is_agent_closing(reply), reply)
+    # The negative cases are the ones that would hang up on a live caller:
+    # caller-side phrases the agent can use mid-conversation, replies that still
+    # ask a question, and replies that merely CONTAIN sign-off vocabulary
+    # ("take care of that", "bye for now, the store will call you"). The last
+    # group is why the detector matches the whole final clause, not a phrase.
+    for reply in (
+        "No thanks needed, happy to help.",
+        "That is all I needed, thanks.",
+        "Is there anything else before I let you go?",
+        "Would you like the store to call you back?",
+        "I can help with Bell mobility and our Employee Purchase Program.",
+        "I can take care of that for you.",
+        "We can take care of the activation fee.",
+        "Bye for now, the store will call you.",
+        # A lowercase tail is content, not a name: stripping it would turn
+        # "thanks for calling" into a sign-off and hang up mid-conversation.
+        "Thanks for calling, go ahead.",
+        "Thanks for calling, one moment.",
+        "Goodbye. Is there anything else?",
+        "",
+        "   ",
+    ):
+        check(f"is_agent_closing({reply!r}) -> False",
+              not server.is_agent_closing(reply), reply)
+    # The agent-side detector must be narrower than CLOSING_RE, or a reply like
+    # "No thanks needed" would end the call mid-conversation.
+    check("is_agent_closing is narrower than CLOSING_RE",
+          bool(server.CLOSING_RE.search("No thanks needed, happy to help."))
+          and not server.is_agent_closing("No thanks needed, happy to help."),
+          "the agent detector is not narrower than CLOSING_RE")
+
     # --- /amd: AsyncAmdStatusCallback; POST-only, signature-checked, empty 200 ---
     check("GET /amd -> 405", client.get("/amd").status_code == 405)
     ap = {"CallSid": "CA123", "AnsweredBy": "machine_start"}

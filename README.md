@@ -237,6 +237,46 @@ The table lives in `HANDOFF_ROUTES` in `server.py`. Changing a destination is a
 one-line edit there; `test_sms.py` asserts the exact set of extensions, so a
 typo fails the gate rather than dialling a wrong number.
 
+### A closing ends the call
+
+`/handoff` is the action URL for two different endings, so `handoffData.action`
+tells them apart:
+
+| `action` | Who ended it | `/handoff` returns |
+| :--- | :--- | :--- |
+| absent | the caller asked for a person | `<Dial>` to the store with the extension as DTMF |
+| `close` | the agent signed off | empty TwiML, which hangs the call up |
+
+The key is `action`, not `reason`: every close reason must hang up, so adding
+one (`caller-closed`, `permission-give-up`) can never silently start dialling
+the store.
+
+`is_agent_closing()` decides the close from the model's own reply. It matches
+only when the sign-off is the whole final clause — "Goodbye.", "Have a good
+day, Jonathan.", "Thanks for calling Cellular Solution. Take care." — and never
+when the reply ends in a question. A phrase-level match would hang up on a live
+caller: "I can take care of that for you." contains "take care" and "Bye for
+now, the store will call you." contains "bye", and neither ends the
+conversation.
+
+Two things happen before the session ends:
+
+- **The goodbye is not cut off.** The relay waits out the playback estimate
+  before sending `end`, because ConversationRelay tears the session down the
+  moment it arrives.
+- **A barge-in cancels the close.** The wait is a receive, not a sleep: if the
+  caller cuts in during the sign-off ("wait, one more thing"), the message is
+  buffered for the main loop and the call stays up. A blind sleep would hang up
+  on a caller who was still talking.
+
+If the socket drops mid-goodbye, Twilio posts `/handoff` with no `HandoffData`.
+The relay records the close intent in the `CLOSE_PENDING` set before the wait,
+so the store is not dialled for a caller who was being hung up on. The entry is
+discarded when read and withdrawn on a barge-in, so it can never suppress a
+later real handoff. It is a separate set rather than a `CALL_STATE` key because
+`CALL_STATE` is copied into the handler's state on a reconnect and re-saved
+every turn, which would resurrect the flag.
+
 ## Changing the agent's wording without touching code
 
 All runtime-tunable wording and relay settings are overridable via environment
