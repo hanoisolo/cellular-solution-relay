@@ -572,6 +572,14 @@ def check_forbidden_question():
         )
 
     # Legitimate replies must still commit, or every turn pays the hold.
+    # The price reply is legitimate only because the offers block is
+    # configured, exactly as it is on Railway: the invented-price guard holds
+    # any figure the block does not contain.
+    import os as _os
+
+    _os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "iPhone 17 256GB SmartPay Ultra $62.91 a month with tax"
+    )
     for text in (
         "Would you like the store to call you back about Bell's Employee "
         "Purchase Program?",
@@ -583,6 +591,7 @@ def check_forbidden_question():
             f"legitimate reply flagged as unanswerable: {text!r}"
         )
         assert _gate_commits(text), f"legitimate reply would be held: {text!r}"
+    _os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
 
     # The replacement must itself be answerable and must not trip the guard.
     assert "?" in CALLBACK_QUESTION_FALLBACK, CALLBACK_QUESTION_FALLBACK
@@ -1519,6 +1528,171 @@ async def check_transfer_denial_guard_late_ws():
             f"a transfer fallback was not substituted: {spoken!r}"
         )
     print("TRANSFER DENIAL GUARD (late): pass — caught after the commit point")
+
+
+async def _collect_reply(ws, timeout=10):
+    """Read one spoken reply (interruptible text tokens up to last=true)."""
+    tokens = []
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        m = json.loads(raw)
+        if m.get("type") != "text" or m.get("interruptible") is False:
+            continue
+        tokens.append(m.get("token") or "")
+        if m.get("last") is True:
+            break
+    return "".join(tokens).strip()
+
+
+async def check_transfer_promise_guard_ws():
+    """End-to-end: the model announcing a transfer it cannot perform must
+    never be spoken. handoff_route() runs on the caller's words before the
+    model is called, so any real transfer has already happened. On CAe33eb7
+    the agent said "I'm connecting you to the store at 905-264-2228 now"
+    twice and never dialled."""
+    from server import TRANSFER_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000025"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, promiseref",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert "connecting" not in spoken.lower(), (
+            f"the false transfer promise was spoken: {spoken!r}"
+        )
+        assert spoken in TRANSFER_FALLBACKS, (
+            f"expected a transfer fallback, got: {spoken!r}"
+        )
+    print("TRANSFER PROMISE GUARD WS: pass — the promise is replaced")
+
+
+async def check_transfer_promise_guard_late_ws():
+    """End-to-end: a promise arriving AFTER the pre-speech gate committed must
+    still never be spoken."""
+    from server import TRANSFER_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000026"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, promiseref_late",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert "connecting" not in spoken.lower(), (
+            f"the late transfer promise was spoken: {spoken!r}"
+        )
+        assert any(f in spoken for f in TRANSFER_FALLBACKS), (
+            f"a transfer fallback was not substituted: {spoken!r}"
+        )
+    print("TRANSFER PROMISE GUARD (late): pass — caught after the commit point")
+
+
+async def check_invented_price_guard_ws():
+    """End-to-end: a dollar figure the VERIFIED OFFERS blocks do not contain
+    must never be spoken. On CAe33eb7 the agent told a caller "The cheapest
+    Bell mobility plans start at about $35 a month" with RELAY_EPP_PLAN_OFFERS
+    unset."""
+    from server import PRICE_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000027"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, priceref",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert "$35" not in spoken and "35" not in spoken, (
+            f"the invented price was spoken: {spoken!r}"
+        )
+        assert spoken in PRICE_FALLBACKS, (
+            f"expected a price fallback, got: {spoken!r}"
+        )
+    print("INVENTED PRICE GUARD WS: pass — the figure is replaced")
+
+
+async def check_invented_price_guard_late_ws():
+    """End-to-end: a figure arriving AFTER the pre-speech gate committed must
+    still never be spoken."""
+    from server import PRICE_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000028"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, priceref_late",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert "$35" not in spoken and "35" not in spoken, (
+            f"the late invented price was spoken: {spoken!r}"
+        )
+        assert any(f in spoken for f in PRICE_FALLBACKS), (
+            f"a price fallback was not substituted: {spoken!r}"
+        )
+    print("INVENTED PRICE GUARD (late): pass — caught after the commit point")
+
+
+async def check_fragment_prompt_ws():
+    """End-to-end: a one- or two-word turn is a clipped line, not an answer.
+    On CAe33eb7 "It" drew a 294-character, 25-second EPP pitch. The relay now
+    answers a fragment directly, without calling the model."""
+    from server import FRAGMENT_PROMPTS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000029"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "It", "last": True})
+        )
+        spoken = await _collect_reply(ws)
+        assert spoken in FRAGMENT_PROMPTS, (
+            f"expected a fragment prompt, got: {spoken!r}"
+        )
+        assert "Employee Purchase Program" not in spoken, (
+            f"a fragment drew a pitch: {spoken!r}"
+        )
+    print("FRAGMENT PROMPT WS: pass — a clipped turn gets a short question")
 
 
 async def check_pitch_turn_capture_ws():
@@ -2774,6 +2948,11 @@ async def main():
     await check_availability_guard_late_ws()
     await check_transfer_denial_guard_ws()
     await check_transfer_denial_guard_late_ws()
+    await check_transfer_promise_guard_ws()
+    await check_transfer_promise_guard_late_ws()
+    await check_invented_price_guard_ws()
+    await check_invented_price_guard_late_ws()
+    await check_fragment_prompt_ws()
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()

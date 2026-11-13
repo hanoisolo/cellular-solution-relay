@@ -490,6 +490,18 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
     # dials the store's extension — so hold it the same way.
     if TRANSFER_DENIAL_RE.search(t):
         return False
+    # So is a promise to transfer: any real transfer already happened before
+    # the model was called.
+    if TRANSFER_PROMISE_RE.search(t):
+        return False
+    # A dollar figure the offers blocks do not contain is invented.
+    if invented_price(t):
+        return False
+    # A price-ish reply is held until its first sentence completes, so an
+    # invented figure can be replaced with the whole sentence rather than
+    # leaving a dangling lead-in already spoken.
+    if PRICE_RISK_RE.search(t) and not re.search(r"[.?!]", t):
+        return False
     # A closing commits at once: holding it to end-of-stream only delays a
     # goodbye, and is_dead_end no longer treats it as a dead end.
     if CLOSING_RE.search(t):
@@ -622,6 +634,136 @@ TRANSFER_FALLBACKS = (
     "I can have the store reach out to you about that. Would that work?",
 )
 
+# The model ANNOUNCING a transfer it cannot perform. handoff_route() runs on
+# the CALLER's words before the model is called, so by the time the model
+# speaks, any real transfer has already happened — a promise in the reply is
+# therefore always false. On CAe33eb7 the agent said "I can connect you to the
+# store at 905-264-2228 so they can assist further. I'm connecting you now."
+# and then "I'm connecting you to the store at 905-264-2228 now." No handoff
+# fired: the caller was told twice they were being connected and stayed on the
+# line. A false promise is worse than a denial, so it is guarded the same way.
+TRANSFER_PROMISE_RE = re.compile(
+    r"\b(?:i'?m|i am|i'?ll|i will|we'?re|we are|let me|can|could)\s+"
+    r"(?:connect|transfer|put)(?:ing)?\s+(?:you|them)\b"
+    r"|\bconnecting you\b|\btransferring you\b|\bputting you through\b"
+    r"|\bone moment while i\b",
+    re.IGNORECASE,
+)
+
+# A dollar figure the model produced. The VERIFIED OFFERS blocks are the only
+# pricing the agent may quote, so any amount that does not appear in them is
+# invented. On CAe33eb7 the agent told a caller "The cheapest Bell mobility
+# plans start at about $35 a month with the Employee Purchase Program" —
+# RELAY_EPP_PLAN_OFFERS was unset, so $35 came from nowhere, and a caller could
+# hold the store to it. The prompt already forbids this; the model did it
+# anyway, which is why this is a deterministic guard.
+PRICE_AMOUNT_RE = re.compile(
+    r"\$\s?(\d{1,4})(?:\.(\d{1,2}))?"
+    r"|\b(\d{1,4})(?:\.(\d{1,2}))?\s*(?:dollars?|bucks)\b(?:\s+(\d{1,2})\b)?",
+    re.IGNORECASE,
+)
+
+# Spoken instead of an invented price. Both end in a question so the dead-end
+# guard leaves them alone, and neither quotes a figure, so the guard cannot
+# loop on its own fallback.
+PRICE_FALLBACKS = (
+    "I don't have live pricing here, so the store will confirm the exact price "
+    "for you. Would you like them to call you back?",
+    "The store can confirm the exact price for you. Would you like a callback?",
+)
+
+
+# A reply that is heading toward a price. The pre-speech gate normally commits
+# at the first question mark or after three words, which is too early here: by
+# the time the figure arrives the lead-in ("The cheapest Bell mobility plans
+# start at about") has already been spoken, and the caller hears a dangling
+# fragment before the fallback. So a price-ish reply is held until its first
+# sentence completes, and the whole sentence is then replaced if the figure is
+# invented. Only price replies pay the hold.
+PRICE_RISK_RE = re.compile(
+    r"\$|\b(?:dollars?|bucks|price|pricing|costs?|monthly|cheapest|cheaper)\b"
+    r"|\b(?:start|starts|starting) at\b|\ba month\b|\bper month\b",
+    re.IGNORECASE,
+)
+
+
+def _amounts(text: str) -> set[str]:
+    """Every dollar figure in `text`, normalized to a bare 2dp number string.
+
+    Handles the spoken forms the model actually produces: "$62.91", "$62",
+    "62.91 dollars", "62 dollars", and "62 dollars 91" (the cents said
+    separately, which is how a price reads aloud).
+    """
+    out: set[str] = set()
+    for m in PRICE_AMOUNT_RE.finditer(text or ""):
+        whole = m.group(1) or m.group(3)
+        if not whole:
+            continue
+        cents = m.group(2) or m.group(4) or m.group(5) or "0"
+        try:
+            out.add(f"{float(whole) + float(cents) / 100:.2f}")
+        except ValueError:
+            continue
+    return out
+
+
+def invented_price(reply: str) -> bool:
+    """True when the reply quotes a dollar figure the offers blocks do not
+    contain. With no offers configured, every figure is invented."""
+    quoted = _amounts(reply)
+    if not quoted:
+        return False
+    verified = _amounts(
+        _env_or("RELAY_EPP_HARDWARE_OFFERS", EPP_HARDWARE_OFFERS)
+        + " "
+        + _env_or("RELAY_EPP_PLAN_OFFERS", EPP_PLAN_OFFERS)
+    )
+    return bool(quoted - verified)
+
+
+# A one- or two-word caller turn that cannot stand alone. STT returns
+# fragments when the caller is cut off or the line clips: on CAe33eb7 "It"
+# drew a 294-character, 25-second EPP pitch and "My." drew "It sounds like you
+# may have something to share." A fragment needs a short clarifying question,
+# not a pitch, so the relay answers it directly instead of calling the model.
+#
+# Only words that cannot be an answer count. A single meaningful word —
+# "billing", "iPhone", "EPP" — is a real request and still reaches the model,
+# so the guard cannot swallow a caller who says one useful thing.
+FRAGMENT_MAX_WORDS = 2
+FRAGMENT_WORDS = frozenset({
+    "a", "ah", "an", "and", "are", "at", "be", "been", "but", "can", "could",
+    "did", "do", "does", "er", "for", "had", "has", "have", "he", "here",
+    "how", "i", "i'm", "im", "in", "is", "it", "it's", "its", "just", "like",
+    "me", "my", "not", "of", "oh", "on", "she", "should", "so", "that",
+    "that's", "thats", "the", "there", "they", "this", "to", "uh", "um",
+    "was", "we", "well", "were", "what", "when", "where", "who", "why",
+    "will", "with", "would", "you", "your",
+})
+FRAGMENT_PROMPTS = (
+    "Sorry, I only caught part of that — what can I help you with?",
+    "I didn't get all of that. What can I help you with today?",
+)
+
+
+def is_fragment(user_text: str) -> bool:
+    """True when the caller's turn is too short to be an answer.
+
+    A greeting or a yes/no is a real turn and is left to the model, as is
+    anything carrying a digit (a phone number or a price the caller is
+    quoting). Otherwise the turn is a fragment only when every word in it is
+    one that cannot stand alone.
+    """
+    t = (user_text or "").strip()
+    if not t or GREETING_ONLY_RE.match(t):
+        return False
+    if any(ch.isdigit() for ch in t):
+        return False
+    words = [w for w in re.split(r"[\s,.;:!?]+", t.lower()) if w]
+    if not words or len(words) > FRAGMENT_MAX_WORDS:
+        return False
+    return all(w in FRAGMENT_WORDS for w in words)
+
 
 def claims_staff_availability(reply: str) -> bool:
     """True when the reply says whether a named colleague is available.
@@ -693,6 +835,75 @@ def _transfer_denial_at(spoken: str, pending: str) -> int | None:
     if cut != -1:
         start = cut + 2
     return max(0, start - len(tail))
+
+
+def _transfer_promise_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where a false transfer promise starts, or None.
+
+    Same shape as _transfer_denial_at: the pre-speech gate only holds a reply
+    until it commits, so a promise arriving after the commit point would
+    stream out unfiltered.
+    """
+    look = 64
+    tail = (spoken or "")[-look:]
+    window = tail + (pending or "")
+    m = TRANSFER_PROMISE_RE.search(window)
+    if not m:
+        return None
+    start = m.start()
+    cut = max(
+        window.rfind(". ", 0, start),
+        window.rfind("? ", 0, start),
+        window.rfind("! ", 0, start),
+    )
+    if cut != -1:
+        start = cut + 2
+    return max(0, start - len(tail))
+
+
+def _invented_price_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where an invented price starts, or None.
+
+    Same shape as _transfer_denial_at. The lookback is wider than the other
+    guards because a price claim carries its own lead-in ("the cheapest plans
+    start at about $35 a month"), and cutting mid-sentence would leave the
+    caller with a dangling fragment.
+    """
+    look = 96
+    tail = (spoken or "")[-look:]
+    window = tail + (pending or "")
+    if not invented_price(window):
+        return None
+    verified = _amounts(
+        _env_or("RELAY_EPP_HARDWARE_OFFERS", EPP_HARDWARE_OFFERS)
+        + " "
+        + _env_or("RELAY_EPP_PLAN_OFFERS", EPP_PLAN_OFFERS)
+    )
+    for m in PRICE_AMOUNT_RE.finditer(window):
+        whole = m.group(1) or m.group(3)
+        if not whole:
+            continue
+        cents = m.group(2) or m.group(4) or m.group(5) or "0"
+        try:
+            amount = f"{float(whole) + float(cents) / 100:.2f}"
+        except ValueError:
+            continue
+        if amount in verified:
+            continue
+        start = m.start()
+        cut = max(
+            window.rfind(". ", 0, start),
+            window.rfind("? ", 0, start),
+            window.rfind("! ", 0, start),
+        )
+        if cut == -1:
+            # No sentence boundary to cut at, so the whole pending buffer is
+            # the lead-in ("The cheapest Bell mobility plans start at about").
+            # Speaking it would leave the caller with a dangling fragment
+            # before the fallback, so drop all of it.
+            return 0
+        return max(0, cut + 2 - len(tail))
+    return None
 
 
 def is_repeat(prev: str, cur: str) -> bool:
@@ -855,9 +1066,14 @@ SYSTEM_PROMPT = (
     "905-264-2228. Offer to check eligibility on the website or to arrange "
     "a store callback. "
     "Never say you cannot transfer or connect a call. You can: the phone "
-    "system puts callers through to the store. If a caller asks to be "
-    "transferred, say you are connecting them and stop talking — do not "
-    "answer their question yourself. "
+    "system puts callers through to the store. Never announce a transfer "
+    "yourself either — do not say you are connecting, transferring or putting "
+    "someone through, because the phone system has already done it before you "
+    "speak. If a caller wants a person and is still on the line, offer a "
+    "callback from the store. "
+    "Never state a price, a monthly payment or a dollar amount unless it "
+    "appears word for word in the verified pricing blocks below. If you do "
+    "not have it, say the store will confirm the exact price. "
     "Pronunciation: always say the website as 'cellular solution dot c a' — "
     "two words, cellular and solution. Never say 'w w w' or 'triple w'. "
     "Never repeat a previous reply, in whole or in part. Say the website "
@@ -1038,6 +1254,30 @@ MOCK_REPLIES = {
     "canttransferref_late": (
         "Would you like the store to call you back? I can't transfer calls."
     ),
+    # A false transfer promise, so the promise guard can be exercised
+    # end-to-end. The promise is the FIRST sentence, so the pre-speech gate
+    # holds it. Only reachable in MOCK_LLM mode.
+    "promiseref": (
+        "I'm connecting you to the store at 905-264-2228 now. Is there "
+        "anything else I can help with?"
+    ),
+    # The same promise AFTER a sentence that commits the pre-speech gate, so
+    # only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "promiseref_late": (
+        "Would you like the store to call you back? I'm connecting you now."
+    ),
+    # An invented price, so the price guard can be exercised end-to-end. The
+    # figure is the FIRST sentence, so the pre-speech gate holds it. Only
+    # reachable in MOCK_LLM mode.
+    "priceref": (
+        "The cheapest Bell mobility plans start at about $35 a month with the "
+        "Employee Purchase Program. Would you like the store to call you back?"
+    ),
+    # The same figure AFTER a sentence that commits the pre-speech gate, so
+    # only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "priceref_late": (
+        "Would you like the store to call you back? Plans start at $35 a month."
+    ),
 }
 
 
@@ -1091,6 +1331,15 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["canttransferref_late"]
     if "canttransferref" in lowered:
         return MOCK_REPLIES["canttransferref"]
+    if "promiseref_late" in lowered:
+        return MOCK_REPLIES["promiseref_late"]
+    if "promiseref" in lowered:
+        return MOCK_REPLIES["promiseref"]
+    # Before the "price" probe: "priceref" contains "price".
+    if "priceref_late" in lowered:
+        return MOCK_REPLIES["priceref_late"]
+    if "priceref" in lowered:
+        return MOCK_REPLIES["priceref"]
     if "takecareref" in lowered:
         return MOCK_REPLIES["takecare"]
     if "pitchref" in lowered:
@@ -2070,6 +2319,9 @@ async def relay_ws(websocket: WebSocket) -> None:
     interrupted = False
     ack_index = 0
     last_ack_at = 0.0
+    # Rotates the clarifying question asked of a fragment turn, so a caller
+    # whose line keeps clipping does not hear the same sentence twice.
+    fragment_index = 0
     # Idle prompt: armed once the caller has spoken, so it can never talk over
     # the opening. At most IDLE_PROMPTS_MAX prompts per caller turn.
     caller_spoke = False
@@ -2356,6 +2608,43 @@ async def relay_ws(websocket: WebSocket) -> None:
                             full = TRANSFER_FALLBACKS[0]
                             await _flush(full)
                             break
+                        promise = _transfer_promise_at(
+                            spoken_box[0] if spoken_box is not None else "", pending
+                        )
+                        if promise is not None:
+                            # The model is announcing a transfer it cannot
+                            # perform. Same treatment: say the safe prefix,
+                            # then the fallback, and drop the rest.
+                            safe = pending[:promise]
+                            pending = ""
+                            if safe:
+                                await _flush(safe)
+                            log_event(
+                                "transfer_promise_guard",
+                                callSid=call_sid,
+                                text=full.strip(),
+                            )
+                            full = TRANSFER_FALLBACKS[0]
+                            await _flush(full)
+                            break
+                        price = _invented_price_at(
+                            spoken_box[0] if spoken_box is not None else "", pending
+                        )
+                        if price is not None:
+                            # A dollar figure the offers blocks do not contain
+                            # is invented. Same treatment.
+                            safe = pending[:price]
+                            pending = ""
+                            if safe:
+                                await _flush(safe)
+                            log_event(
+                                "invented_price_guard",
+                                callSid=call_sid,
+                                text=full.strip(),
+                            )
+                            full = PRICE_FALLBACKS[0]
+                            await _flush(full)
+                            break
                         emit, pending = _split_pending(pending)
                         await _flush(emit)
                 token = await _next_token()
@@ -2392,6 +2681,24 @@ async def relay_ws(websocket: WebSocket) -> None:
                     _norm_text(r) == _norm_text(replacement) for r in recent_replies
                 ):
                     replacement = TRANSFER_FALLBACKS[1]
+            elif TRANSFER_PROMISE_RE.search(gate):
+                log_event(
+                    "transfer_promise_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = TRANSFER_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = TRANSFER_FALLBACKS[1]
+            elif invented_price(gate):
+                log_event(
+                    "invented_price_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = PRICE_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = PRICE_FALLBACKS[1]
             elif repeated is not None:
                 # A repeat in answer to a clear question is an ANSWER, not a
                 # loop: the post-pitch prompt tells the model what to say when
@@ -2640,6 +2947,23 @@ async def relay_ws(websocket: WebSocket) -> None:
                         route=route,
                     )
                     return
+
+                # A one- or two-word turn is a fragment, not an answer: the
+                # caller was cut off or the line clipped. Answer it directly
+                # with a short clarifying question instead of calling the
+                # model, which pitched a 25-second EPP monologue at "It" and
+                # answered "My." with "It sounds like you may have something
+                # to share." (CAe33eb7). Not added to history, like the
+                # interrupt ack: it is a prompt, not something the model said.
+                if is_fragment(user_text):
+                    prompt = FRAGMENT_PROMPTS[fragment_index % len(FRAGMENT_PROMPTS)]
+                    fragment_index += 1
+                    await send_speech(prompt, True, True, "fragment")
+                    log_event(
+                        "fragment_prompt", callSid=call_sid, text=user_text,
+                        spoken=prompt,
+                    )
+                    continue
 
                 # The caller talked over the agent. Acknowledge it before the
                 # answer so the cut sounds like a person yielding the floor

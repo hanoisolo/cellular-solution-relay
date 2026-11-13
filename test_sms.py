@@ -654,6 +654,112 @@ def main():
         check(f"handoff_route port-in {text!r} -> no handoff",
               route is None, f"{route!r}")
 
+    # --- False transfer promises: the model announcing a transfer it cannot
+    # perform. handoff_route() runs on the CALLER's words before the model is
+    # called, so any real transfer has already happened. On CAe33eb7 the agent
+    # said "I'm connecting you to the store at 905-264-2228 now" twice and
+    # never dialled. ---
+    for promise in (
+        "I'm connecting you now.",
+        "I can connect you to the store at 905-264-2228.",
+        "Let me put you through.",
+        "I'll transfer you now.",
+        "One moment while I connect you.",
+        "Connecting you to the store.",
+    ):
+        check(f"TRANSFER_PROMISE_RE matches {promise!r}",
+              server.TRANSFER_PROMISE_RE.search(promise) is not None, promise)
+    for clean in (
+        "",
+        "Would you like the store to call you back?",
+        "The store can help with that.",
+        "I can't transfer calls.",
+        # The fallbacks themselves must never trip the guard, or it loops.
+        *server.TRANSFER_FALLBACKS,
+    ):
+        check(f"TRANSFER_PROMISE_RE ignores {clean!r}",
+              server.TRANSFER_PROMISE_RE.search(clean) is None, clean)
+    check("_gate_commits holds a transfer promise",
+          server._gate_commits("I'm connecting you to the store now.") is False,
+          "committed")
+
+    # --- Invented prices: the VERIFIED OFFERS blocks are the only pricing the
+    # agent may quote. On CAe33eb7 it told a caller "The cheapest Bell mobility
+    # plans start at about $35 a month" with RELAY_EPP_PLAN_OFFERS unset. ---
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    os.environ.pop("RELAY_EPP_PLAN_OFFERS", None)
+    check("invented_price: no offers configured means every figure is invented",
+          server.invented_price(
+              "The cheapest plans start at about $35 a month.") is True,
+          "not flagged")
+    check("invented_price: a reply with no figure is clean",
+          server.invented_price(
+              "The store will confirm the exact price for you.") is False,
+          "flagged")
+    check("invented_price: a phone number is not a price",
+          server.invented_price("Call the store at 905-264-2228.") is False,
+          "flagged")
+    check("invented_price: a percentage is not a price",
+          server.invented_price("EPP gives up to 30 percent off.") is False,
+          "flagged")
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "iPhone 17 256GB SmartPay Ultra $62.91 a month with tax"
+    )
+    check("invented_price: a figure from the offers block is allowed",
+          server.invented_price(
+              "The iPhone 17 256GB SmartPay Ultra is $62.91 a month with tax.")
+          is False, "flagged")
+    check("invented_price: a figure absent from the offers block is invented",
+          server.invented_price(
+              "The cheapest plans start at about $35 a month.") is True,
+          "not flagged")
+    check("invented_price: one verified and one invented figure is invented",
+          server.invented_price(
+              "The iPhone 17 is $62.91 a month and plans start at $35.")
+          is True, "not flagged")
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    check("_gate_commits holds an invented price",
+          server._gate_commits(
+              "The cheapest plans start at about $35 a month.") is False,
+          "committed")
+    check("_gate_commits lets the price fallback through",
+          server._gate_commits(server.PRICE_FALLBACKS[0]) is True, "held")
+    for fallback in server.PRICE_FALLBACKS:
+        check("price fallback is an open turn", "?" in fallback, fallback)
+        check("price fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
+        check("price fallback quotes no figure",
+              server.invented_price(fallback) is False, fallback)
+
+    # --- Fragment turns: a one- or two-word utterance is a clipped line, not
+    # an answer. On CAe33eb7 "It" drew a 294-character, 25-second EPP pitch and
+    # "My." drew "It sounds like you may have something to share." ---
+    for fragment in ("It", "My.", "That's", "Uh, my", "the"):
+        check(f"is_fragment({fragment!r}) -> True",
+              server.is_fragment(fragment) is True, "not a fragment")
+    for real in (
+        "",
+        "No.",
+        "Yeah.",
+        "Hello.",
+        "Uh, yeah.",
+        "I want to talk to Ed",
+        "How much is the iPhone 17?",
+        "416-555-0100",
+        "My number is 416 555 0100",
+        # A single meaningful word is a real request, not a clipped line.
+        "billing",
+        "EPP",
+        "iPhone",
+        "Neelam",
+    ):
+        check(f"is_fragment({real!r}) -> False",
+              server.is_fragment(real) is False, "treated as a fragment")
+    for prompt in server.FRAGMENT_PROMPTS:
+        check("fragment prompt is an open turn", "?" in prompt, prompt)
+        check("fragment prompt is not a sign-off",
+              not server.CLOSING_RE.search(prompt), prompt)
+
     # HANDOFF_PEOPLE drives the guard, so it must stay in step with the
     # routing table or a renamed colleague silently loses the guard.
     route_labels = {label for _, label, _ in server.HANDOFF_ROUTES}
