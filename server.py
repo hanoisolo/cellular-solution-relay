@@ -1005,6 +1005,57 @@ HANDOFF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Where a handoff lands. The store's main line is one number; every
+# destination is a DTMF extension on it, dialled with <Number sendDigits>.
+# Order matters: a name beats a department, so "I need Ed in accounts payable"
+# is a call for Ed. The last entry is the default — what "can I talk to a real
+# person" means on this line — and is also what an outbound handoff uses,
+# because a prospect who asks for a person wants the EPP desk, not a named
+# staff member.
+#
+# The accounts patterns are deliberately narrow. "billing" and "payment" are
+# NOT here: a sales prospect asking "what's the monthly payment?" must not be
+# routed to accounts receivable.
+HANDOFF_ROUTES = (
+    ("226", "Neelam", re.compile(r"\bneelam\b", re.IGNORECASE)),
+    ("232", "Dwayne", re.compile(r"\bdwayne\b", re.IGNORECASE)),
+    ("231", "Ed", re.compile(r"\bed\b", re.IGNORECASE)),
+    (
+        "220",
+        "accounts receivable",
+        re.compile(
+            r"\b(accounts? (receivable|payable)|receivables?|payables?|"
+            r"a\s*/\s*r|a\s*/\s*p|invoic(?:e|es|ing))\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+DEFAULT_HANDOFF_ROUTE = ("225", "our Bell EPP desk")
+
+# A pause before the extension digits. Twilio sends "w" as half a second, and
+# the store's auto-attendant needs a moment to answer before it will take
+# digits. Two halves = one second.
+HANDOFF_DIGIT_PAUSE = "ww"
+
+
+def handoff_route(user_text: str, is_outbound: bool = False) -> tuple[str, str] | None:
+    """The (extension, spoken label) for this turn, or None to keep talking.
+
+    Returns a route when the caller asked for a person or for one of the
+    destinations above; None means the model should answer normally. Outbound
+    calls always use the default: the caller is a prospect, and a stray name in
+    their sentence is not a request to be transferred to that person.
+    """
+    if is_outbound:
+        return DEFAULT_HANDOFF_ROUTE if HANDOFF_RE.search(user_text or "") else None
+    t = user_text or ""
+    for extension, label, pattern in HANDOFF_ROUTES:
+        if pattern.search(t):
+            return extension, label
+    if HANDOFF_RE.search(t):
+        return DEFAULT_HANDOFF_ROUTE
+    return None
+
 
 def _truncate_to_utterance(spoken: str, utterance: str) -> str:
     """Cut a spoken reply down to what the caller actually heard.
@@ -1384,11 +1435,47 @@ async def handoff_action(request: Request) -> Response:
         )
         return Response(content=EMPTY_RESPONSE_XML, media_type="application/xml")
     store = os.environ.get("RELAY_STORE_NUMBER", "").strip() or "+19052642228"
+    # The relay chose an extension for this caller (a named staff member, the
+    # accounts desk, or the EPP desk by default). It arrives as JSON in
+    # HandoffData, which is caller-influenced only through the relay's own
+    # routing table — but it is still validated before it reaches TwiML, so a
+    # malformed or hostile payload can never inject markup or dial digits.
+    extension = ""
+    label = ""
+    if handoff_data:
+        try:
+            parsed = json.loads(handoff_data)
+        except ValueError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            route = parsed.get("route")
+            if isinstance(route, dict):
+                candidate = str(route.get("extension") or "").strip()
+                if candidate.isdigit() and 1 <= len(candidate) <= 6:
+                    extension = candidate
+                    label = str(route.get("label") or "").strip()[:40]
+    if extension:
+        number = (
+            f'<Number sendDigits="{HANDOFF_DIGIT_PAUSE}{extension}">'
+            f"{_xml_escape(store)}</Number>"
+        )
+        say = f"Connecting you to {_xml_escape(label)} now." if label else (
+            "Connecting you to our store now."
+        )
+    else:
+        number = f"<Number>{_xml_escape(store)}</Number>"
+        say = "Connecting you to our store now."
+    log_event(
+        "handoff_dial",
+        callSid=params.get("CallSid", ""),
+        extension=extension or None,
+        label=label or None,
+    )
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>Connecting you to our store now.</Say>"
-        f'<Dial timeout="30"><Number>{_xml_escape(store)}</Number></Dial>'
+        f"<Say>{say}</Say>"
+        f'<Dial timeout="30">{number}</Dial>'
         "</Response>"
     )
     return Response(content=xml, media_type="application/xml")
@@ -1617,10 +1704,24 @@ async def relay_ws(websocket: WebSocket) -> None:
         if call_sid:
             CALL_STATE[call_sid] = dict(state)
 
-    async def do_handoff(reason: str, extra: dict | None = None) -> None:
+    async def do_handoff(
+        reason: str,
+        extra: dict | None = None,
+        route: tuple[str, str] | None = None,
+    ) -> None:
         """End the relay session; Twilio then POSTs the action URL (/handoff)
-        and the caller is connected to the store line."""
-        payload = {"reason": reason, "callSid": call_sid}
+        and the caller is connected to the store line.
+
+        `route` is the (extension, label) the caller should land on. It rides
+        in handoffData because /handoff is a separate HTTP request with no
+        access to this session's state.
+        """
+        extension, label = route or DEFAULT_HANDOFF_ROUTE
+        payload = {
+            "reason": reason,
+            "callSid": call_sid,
+            "route": {"extension": extension, "label": label},
+        }
         if state["callback_name"] or state["callback_phone"]:
             payload["callback"] = {
                 "name": state["callback_name"],
@@ -1628,7 +1729,9 @@ async def relay_ws(websocket: WebSocket) -> None:
             }
         if extra:
             payload.update(extra)
-        log_event("handoff", callSid=call_sid, reason=reason)
+        log_event(
+            "handoff", callSid=call_sid, reason=reason, extension=extension, label=label
+        )
         await websocket.send_json(
             {"type": "end", "handoffData": json.dumps(payload)}
         )
@@ -1972,10 +2075,17 @@ async def relay_ws(websocket: WebSocket) -> None:
                 state["caller_turns"] += 1
                 history.append({"role": "user", "content": user_text})
 
-                # Caller asked for a person: hand off instead of answering.
-                if HANDOFF_RE.search(user_text):
+                # Caller asked for a person, or for one of the destinations the
+                # store routes by extension ("is Neelam there?", "accounts
+                # payable"). Hand off instead of answering: the model cannot
+                # transfer a call, and guessing at a colleague's availability
+                # is worse than connecting them.
+                route = handoff_route(user_text, is_outbound=is_outbound)
+                if route:
                     await do_handoff(
-                        "caller-requested-human", {"lastUtterance": user_text}
+                        "caller-requested-human",
+                        {"lastUtterance": user_text},
+                        route=route,
                     )
                     return
 

@@ -20,6 +20,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -274,6 +275,146 @@ def main():
     check("POST /handoff no CallStatus -> dials (unchanged)",
           r.status_code == 200 and dial is not None and dial.text == "+19052642228",
           f"{r.status_code} {r.text[:200]}")
+
+    # --- /handoff extension routing: the relay picks the destination, the
+    # TwiML dials the store line and sends the extension as DTMF. ---
+    def handoff_route_of(route_obj):
+        """POST /handoff with a route in HandoffData; return (dial, say)."""
+        data = {"reason": "caller-requested-human"}
+        if route_obj is not None:
+            data["route"] = route_obj
+        resp = post_signed(
+            "/handoff",
+            {"CallSid": "CA123", "HandoffData": json.dumps(data)},
+            "tok-123",
+        )
+        root = ET.fromstring(resp.content)
+        return resp, root.find("./Dial/Number"), root.find("./Say")
+
+    for extension, label in (
+        ("226", "Neelam"),
+        ("232", "Dwayne"),
+        ("231", "Ed"),
+        ("220", "accounts receivable"),
+        ("225", "our Bell EPP desk"),
+    ):
+        resp, dial, say = handoff_route_of({"extension": extension, "label": label})
+        check(f"POST /handoff route {extension} -> sendDigits {extension}",
+              resp.status_code == 200
+              and dial is not None
+              and dial.text == "+19052642228"
+              and dial.get("sendDigits") == server.HANDOFF_DIGIT_PAUSE + extension,
+              f"{resp.status_code} {resp.text[:200]}")
+        check(f"POST /handoff route {extension} -> Say names {label}",
+              say is not None and label in (say.text or ""),
+              f"{resp.text[:200]}")
+
+    # No route in HandoffData (an older relay, or a dropped socket) must keep
+    # the old behaviour: dial the store line with no digits.
+    resp, dial, say = handoff_route_of(None)
+    check("POST /handoff no route -> dials with no sendDigits",
+          resp.status_code == 200 and dial is not None
+          and dial.get("sendDigits") is None
+          and dial.text == "+19052642228",
+          f"{resp.status_code} {resp.text[:200]}")
+
+    # HandoffData is caller-influenced only through the relay's routing table,
+    # but it is still validated before it reaches TwiML: a non-numeric or
+    # oversized extension must never be dialled or injected as markup.
+    for bad in ("22a", "225;", "<script>", "1" * 7, "", "  ", "225 226"):
+        resp, dial, say = handoff_route_of({"extension": bad, "label": "x"})
+        check(f"POST /handoff bad extension {bad!r} -> no sendDigits",
+              resp.status_code == 200 and dial is not None
+              and dial.get("sendDigits") is None
+              and dial.text == "+19052642228",
+              f"{resp.status_code} {resp.text[:200]}")
+    # A route that is not an object at all must not crash the endpoint.
+    for bad_route in ("226", ["226"], 226, {"extension": None}):
+        resp, dial, say = handoff_route_of(bad_route)
+        check(f"POST /handoff malformed route {bad_route!r} -> no sendDigits",
+              resp.status_code == 200 and dial is not None
+              and dial.get("sendDigits") is None,
+              f"{resp.status_code} {resp.text[:200]}")
+    # HandoffData that is not JSON at all must not crash the endpoint.
+    resp = post_signed("/handoff",
+                       {"CallSid": "CA123", "HandoffData": "not json"},
+                       "tok-123")
+    dial = ET.fromstring(resp.content).find("./Dial/Number")
+    check("POST /handoff non-JSON HandoffData -> dials with no sendDigits",
+          resp.status_code == 200 and dial is not None
+          and dial.get("sendDigits") is None,
+          f"{resp.status_code} {resp.text[:200]}")
+
+    # --- handoff_route(): who the caller asked for, and where they go. ---
+    for text, expected in (
+        ("Can I speak to a representative?", "225"),
+        ("I want to talk to a real person about EPP", "225"),
+        ("Is there someone real I can talk to?", "225"),
+        ("Is Neelam there?", "226"),
+        ("Can you transfer me to Dwayne please", "232"),
+        ("I need to speak with Ed", "231"),
+        ("This is about accounts receivable", "220"),
+        ("Calling about accounts payable", "220"),
+        ("I have an invoice question", "220"),
+        ("I need to speak to A/R", "220"),
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route({text!r}) -> {expected}",
+              route is not None and route[0] == expected,
+              f"{route!r}")
+
+    # A name beats a department: the caller asked for a person, and that
+    # person's extension is the one that reaches them.
+    route = server.handoff_route("I need Ed in accounts payable")
+    check("handoff_route: a name beats a department",
+          route is not None and route[0] == "231", f"{route!r}")
+
+    # The accounts patterns are deliberately narrow. A sales prospect asking
+    # about a monthly payment or their phone bill must NOT be routed to
+    # accounts receivable — that would send a sale to the wrong desk.
+    for text in (
+        "What is the monthly payment on the iPhone 17?",
+        "How much is my phone bill?",
+        "I already paid my bill",
+        "Tell me about Bell promotions",
+        "What is the price of the iPhone 17?",
+        "Do you have the iPhone 17 in stock?",
+        "Can I get a better rate on my plan?",
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route({text!r}) -> no handoff",
+              route is None, f"{route!r}")
+
+    # Outbound calls are to prospects: a stray name in their sentence is not a
+    # request to be transferred to that person, so only the default applies.
+    route = server.handoff_route("Can I speak to a representative?", is_outbound=True)
+    check("handoff_route outbound: representative -> 225",
+          route is not None and route[0] == "225", f"{route!r}")
+    route = server.handoff_route("Is Neelam there?", is_outbound=True)
+    check("handoff_route outbound: a name is not a transfer request",
+          route is None, f"{route!r}")
+    route = server.handoff_route("I have an invoice question", is_outbound=True)
+    check("handoff_route outbound: accounts is not a transfer request",
+          route is None, f"{route!r}")
+
+    # Every route in the table must be a dialable extension, and the default
+    # must be one of them, or a handoff would dial digits nobody answers.
+    extensions = {ext for ext, _label, _pat in server.HANDOFF_ROUTES}
+    check("handoff routes: extensions are 1-6 digits",
+          all(e.isdigit() and 1 <= len(e) <= 6 for e in extensions),
+          f"{sorted(extensions)}")
+    # The default is the fallback, not a table row: it must still be a
+    # dialable extension, and it must not shadow a named destination.
+    default_ext = server.DEFAULT_HANDOFF_ROUTE[0]
+    check("handoff routes: the default is a dialable extension",
+          default_ext.isdigit() and 1 <= len(default_ext) <= 6,
+          f"{server.DEFAULT_HANDOFF_ROUTE}")
+    check("handoff routes: the default does not shadow a named destination",
+          default_ext not in extensions,
+          f"{default_ext} vs {sorted(extensions)}")
+    check("handoff routes: every destination the store gave us is present",
+          extensions == {"226", "232", "231", "220"},
+          f"{sorted(extensions)}")
 
     # --- /amd: AsyncAmdStatusCallback; POST-only, signature-checked, empty 200 ---
     check("GET /amd -> 405", client.get("/amd").status_code == 405)
