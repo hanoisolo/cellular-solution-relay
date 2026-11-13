@@ -31,7 +31,8 @@ for _k in ("TWILIO_ACCOUNT_SID", "TWILIO_FROM", "TWILIO_API_KEY_SID",
            "TWILIO_API_KEY_SECRET", "STORE_SMS_NUMBER",
            "RELAY_SMS_SYSTEM_PROMPT", "RELAY_WELCOME_GREETING",
            "RELAY_OUTBOUND_GREETING",
-           "RELAY_EPP_HARDWARE_OFFERS", "RELAY_EPP_PLAN_OFFERS"):
+           "RELAY_EPP_HARDWARE_OFFERS", "RELAY_EPP_PLAN_OFFERS",
+           "RELAY_HANDOFF_DIGIT_PAUSE"):
     os.environ.pop(_k, None)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -344,6 +345,38 @@ def main():
           resp.status_code == 200 and dial is not None
           and dial.get("sendDigits") is None,
           f"{resp.status_code} {resp.text[:200]}")
+
+    # --- The DTMF lead-in pause. A pause that is too short gets the digits
+    # swallowed by the store's auto-attendant greeting, and the caller lands on
+    # the main line instead of the extension. The length is therefore tunable
+    # at runtime and clamped to a sane range. ---
+    check("handoff_digit_pause() default is five seconds",
+          server.handoff_digit_pause() == "w" * 10
+          and server.HANDOFF_DIGIT_PAUSE == "w" * 10,
+          repr(server.handoff_digit_pause()))
+    for raw, expected in (
+        ("0", ""),
+        ("2", "ww"),
+        ("20", "w" * 20),
+        ("99", "w" * 20),      # clamped high
+        ("-5", ""),            # clamped low
+        ("abc", "w" * 10),     # not an integer -> default
+        ("", "w" * 10),        # empty -> default
+        (" 4 ", "wwww"),       # surrounding space tolerated
+    ):
+        os.environ["RELAY_HANDOFF_DIGIT_PAUSE"] = raw
+        check(f"handoff_digit_pause() env {raw!r} -> {len(expected)} halves",
+              server.handoff_digit_pause() == expected,
+              repr(server.handoff_digit_pause()))
+    # The endpoint must use the configured pause, not the module default.
+    os.environ["RELAY_HANDOFF_DIGIT_PAUSE"] = "2"
+    resp, dial, say = handoff_route_of({"extension": "231", "label": "Ed"})
+    check("POST /handoff honours RELAY_HANDOFF_DIGIT_PAUSE",
+          resp.status_code == 200 and dial is not None
+          and dial.get("sendDigits") == "ww231",
+          f"{resp.status_code} "
+          f"{dial.get('sendDigits') if dial is not None else None}")
+    os.environ.pop("RELAY_HANDOFF_DIGIT_PAUSE", None)
 
     # --- handoff_route(): who the caller asked for, and where they go. ---
     for text, expected in (

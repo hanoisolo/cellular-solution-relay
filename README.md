@@ -98,6 +98,7 @@ curl -s http://localhost:8000/health
 | `RELAY_IDLE_TEXT` | No | Idle prompt text. Default `"Are you still there?"`. |
 | `RELAY_IDLE_TEXT_2` | No | Second idle prompt, spoken if the first drew no answer. Default `"Take your time. I'm here whenever you're ready."`. |
 | `RELAY_STORE_NUMBER` | No | Store number dialed by `/handoff`. Default `+19052642228`. |
+| `RELAY_HANDOFF_DIGIT_PAUSE` | No | DTMF lead-in pause before the extension digits, in half-seconds (Twilio `w`). Default `10` = five seconds, clamped 0-20. Raise it if a handoff lands on the store's main line instead of the extension. |
 | `RELAY_EPP_HARDWARE_OFFERS` | No | Verified Bell EPP hardware offers block appended to every system prompt (see "EPP offers blocks" below). Default empty = no block. |
 | `RELAY_EPP_PLAN_OFFERS` | No | Verified Bell EPP rate plan offers block, same mechanism. Default empty; set when the rate plan grid is loaded. |
 
@@ -210,8 +211,11 @@ dashboard job:
 When an inbound caller asks for a person, or for one of the destinations below,
 the relay ends the session with the destination in `handoffData` and `/handoff`
 dials `RELAY_STORE_NUMBER` with the extension as DTMF
-(`<Number sendDigits="ww225">`). The `ww` is a one-second pause so the store's
-auto-attendant can answer before it takes digits.
+(`<Number sendDigits="wwwwwwwwww225">`). The `w` characters are a lead-in pause
+of half a second each — five seconds by default — so the store's auto-attendant
+can finish its greeting before it takes digits. A pause that is too short gets
+the digits swallowed and the caller lands on the main line instead of the
+extension; `RELAY_HANDOFF_DIGIT_PAUSE` tunes the length without a code change.
 
 | Caller asks for | Extension | Spoken line |
 | :--- | :--- | :--- |
@@ -301,6 +305,7 @@ the next request or redeploy — no code edit needed):
 | `RELAY_IDLE_TEXT` | idle prompt text | `"Are you still there?"` |
 | `RELAY_IDLE_TEXT_2` | second idle prompt, if the first drew no answer | `"Take your time. I'm here whenever you're ready."` |
 | `RELAY_STORE_NUMBER` | `/handoff` dial target | `+19052642228` |
+| `RELAY_HANDOFF_DIGIT_PAUSE` | `/handoff` DTMF lead-in pause, half-seconds | `10` |
 | `RELAY_WS_URL` | public `wss://` URL written into `/twiml` | derived from request host |
 | `RELAY_LANGUAGE` | STT/TTS language | `en-CA` |
 | `RELAY_TTS_PROVIDER` | TTS provider | `Google` |

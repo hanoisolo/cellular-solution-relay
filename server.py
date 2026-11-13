@@ -1136,9 +1136,32 @@ HANDOFF_ROUTES = (
 DEFAULT_HANDOFF_ROUTE = ("225", "our Bell EPP desk")
 
 # A pause before the extension digits. Twilio sends "w" as half a second, and
-# the store's auto-attendant needs a moment to answer before it will take
-# digits. Two halves = one second.
-HANDOFF_DIGIT_PAUSE = "ww"
+# the store's auto-attendant answers with a greeting before it will take
+# digits: a pause that is too short gets the digits swallowed and the caller
+# lands on the main line instead of the extension. The right length is a
+# property of the store's phone system, not of this code, so it is tunable at
+# runtime — RELAY_HANDOFF_DIGIT_PAUSE is a count of half-seconds, clamped to
+# 0-20 (0-10s). Ten halves = five seconds, which clears a typical greeting.
+HANDOFF_DIGIT_PAUSE_HALVES = 10
+HANDOFF_DIGIT_PAUSE = "w" * HANDOFF_DIGIT_PAUSE_HALVES
+
+
+def handoff_digit_pause() -> str:
+    """The DTMF lead-in pause, as Twilio "w" (half-second) characters.
+
+    Read per request so the length can be tuned on Railway without a code
+    change: how long the store's auto-attendant talks before it accepts
+    digits is not something this repo can know. A value that is not an
+    integer falls back to the default rather than dialling with no pause.
+    """
+    raw = os.environ.get("RELAY_HANDOFF_DIGIT_PAUSE", "").strip()
+    halves = HANDOFF_DIGIT_PAUSE_HALVES
+    if raw:
+        try:
+            halves = int(raw)
+        except ValueError:
+            halves = HANDOFF_DIGIT_PAUSE_HALVES
+    return "w" * max(0, min(20, halves))
 
 
 def handoff_route(user_text: str, is_outbound: bool = False) -> tuple[str, str] | None:
@@ -1590,7 +1613,7 @@ async def handoff_action(request: Request) -> Response:
             label = str(route.get("label") or "").strip()[:40]
     if extension:
         number = (
-            f'<Number sendDigits="{HANDOFF_DIGIT_PAUSE}{extension}">'
+            f'<Number sendDigits="{handoff_digit_pause()}{extension}">'
             f"{_xml_escape(store)}</Number>"
         )
         say = f"Connecting you to {_xml_escape(label)} now." if label else (
