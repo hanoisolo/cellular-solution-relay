@@ -250,10 +250,22 @@ def check_repeat_guard():
     assert REPEAT_FALLBACKS[0] != REPEAT_FALLBACKS[1], REPEAT_FALLBACKS
 
     # The prompt has to stop the loop at the source too: the guard only
-    # rewrites a reply after the model has already produced it.
-    assert "Give the pitch ONCE" in OUTBOUND_SYSTEM_PROMPT, (
-        "outbound prompt lost the say-the-pitch-once rule"
+    # rewrites a reply after the model has already produced it. The pitch is
+    # now spoken by the relay, so the source-level rule is that the model must
+    # never speak it at all — a stronger guarantee than "say it once".
+    assert "The relay speaks the EPP pitch itself" in OUTBOUND_SYSTEM_PROMPT, (
+        "outbound prompt no longer tells the model the relay owns the pitch"
     )
+    # The facts block legitimately states the discount, so the check is for
+    # the pitch's own wording: its opening clause and its callback offer.
+    for fragment in (
+        "gives employees of select partner companies",
+        "Would you like the store to call you back?",
+    ):
+        assert fragment not in OUTBOUND_SYSTEM_PROMPT, (
+            f"outbound prompt still contains the pitch script ({fragment!r}): "
+            "the model could speak it again"
+        )
     for name, prompt in (("outbound", OUTBOUND_SYSTEM_PROMPT), ("inbound", SYSTEM_PROMPT)):
         assert "Never repeat a previous reply" in prompt, (
             f"{name} prompt lost the never-repeat-a-reply rule"
@@ -314,15 +326,25 @@ def check_pitch_phase():
             "prompt would survive the pitch"
         )
 
-    # Phase 1 keeps the trigger; phase 2 must not have it, or an unclear turn
-    # resurrects the pitch script.
-    assert "straight into the pitch" in OUTBOUND_SYSTEM_PROMPT.lower(), (
-        "phase-1 prompt lost the pitch trigger it needs on a 'yes'"
-    )
-    assert "straight into the pitch" not in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH.lower(), (
-        "phase-2 prompt still tells the model to go straight into the pitch: "
-        "an unclear turn will re-pitch"
-    )
+    # The pitch is now spoken by the relay, so NEITHER prompt may carry the
+    # trigger or the script: there is nothing left for the model to re-emit.
+    for name, prompt in (
+        ("phase-1", OUTBOUND_SYSTEM_PROMPT),
+        ("phase-2", OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH),
+    ):
+        assert "straight into the pitch" not in prompt.lower(), (
+            f"{name} prompt still tells the model to go straight into the "
+            "pitch: an unclear turn will re-pitch"
+        )
+        # The facts block legitimately states the discount, so the check is
+        # for the pitch's own wording: its opening clause and its offer.
+        for fragment in (
+            "gives employees of select partner companies",
+            "Would you like the store to call you back?",
+        ):
+            assert fragment not in prompt, (
+                f"{name} prompt still contains the pitch script ({fragment!r})"
+            )
     assert "ALREADY given the EPP pitch" in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH, (
         "phase-2 prompt does not tell the model the pitch is already given"
     )
@@ -751,12 +773,23 @@ async def check_pitch_phase_ws():
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
-        before = await say(ws, "pitchref")
+        # A decline is the one first turn the relay does not pitch on, so it
+        # is the only way to get a model reply while still in phase 1.
+        before = await say(ws, "No thanks, pitchref")
         assert "pre-pitch prompt is still in place" in before, (
             f"the call did not start in the pre-pitch phase: {before!r}"
         )
+        from server import OUTBOUND_PITCH, PITCH_MAX_CHARS  # noqa: E402
+
         pitch = await say(ws, "pitchme")
-        assert "Employee Purchase Program" in pitch, f"no pitch spoken: {pitch!r}"
+        # Exact text: the mock would return MOCK_REPLIES["pitch"] if the model
+        # had generated it, so equality proves the RELAY spoke the pitch.
+        assert pitch == OUTBOUND_PITCH, (
+            f"the relay did not speak the fixed pitch: {pitch!r}"
+        )
+        assert len(pitch) <= PITCH_MAX_CHARS, (
+            f"pitch is {len(pitch)} chars, over the {PITCH_MAX_CHARS} ceiling"
+        )
         after = await say(ws, "pitchref")
         assert "post-pitch prompt is in place" in after, (
             f"the system prompt was not swapped after the pitch: {after!r}"
@@ -805,7 +838,7 @@ async def check_pitch_phase_ws():
         await ws.send(json.dumps(setup3))
         await asyncio.sleep(0.5)
         pitch = await say(ws, "pitchme")
-        assert "Employee Purchase Program" in pitch, f"no pitch spoken: {pitch!r}"
+        assert pitch == OUTBOUND_PITCH, f"no pitch spoken: {pitch!r}"
     setup3_r = dict(setup3)
     setup3_r["connectionType"] = "reconnect"
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -849,6 +882,20 @@ async def check_pitch_phase_ws():
             f"an unmatched interrupt utterance left the call pre-pitch: {after!r}"
         )
     print("PITCH PHASE SWAP (unmatched utterance): pass — falls back to spoken")
+
+    # A clear decline must never be pitched at.
+    setup5 = dict(SETUP)
+    setup5["callSid"] = "CAtest0000000000000000000000000016"
+    setup5["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup5))
+        await asyncio.sleep(0.5)
+        reply = await say(ws, "No, I am busy right now.")
+        assert reply != OUTBOUND_PITCH, (
+            f"a decline was pitched at: {reply!r}"
+        )
+        assert reply, "a decline got no reply at all"
+    print("PITCH ON DECLINE: pass — a 'no' is not pitched at")
 
 
 async def check_ack_suppression():
@@ -919,7 +966,15 @@ async def check_forbidden_question_ws():
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
         await ws.send(
-            json.dumps({"type": "prompt", "voicePrompt": "badq", "last": True})
+            json.dumps(
+                {
+                    "type": "prompt",
+                    # A decline is the one first turn the relay does not pitch
+                    # on, so the model gets the turn and the guard is reached.
+                    "voicePrompt": "No thanks, badq",
+                    "last": True,
+                }
+            )
         )
         tokens = []
         deadline = asyncio.get_event_loop().time() + 10
@@ -1327,6 +1382,9 @@ async def main():
     # live call re-emitted the same 364-char pitch after an interrupt; the
     # truncated assistant turn in history no longer looks like a completed
     # pitch, so the gate compares against state["last_reply"] instead.
+    # Inbound, because the outbound first turn is now the relay's own pitch
+    # rather than a model reply: the guard is direction-agnostic, and this
+    # keeps the repeat model-generated on both turns.
     async def _collect(ws):
         tokens = []
         deadline = asyncio.get_event_loop().time() + 10
@@ -1344,7 +1402,7 @@ async def main():
 
     setup8 = dict(SETUP)
     setup8["callSid"] = "CAtest0000000000000000000000000007"
-    setup8["direction"] = "outbound-api"
+    setup8["direction"] = "inbound"
     async with websockets.connect(WS_URL, max_size=2**20) as ws8:
         await ws8.send(json.dumps(setup8))
         await asyncio.sleep(0.5)
