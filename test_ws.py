@@ -293,6 +293,26 @@ def check_pitch_phase():
         "The store is open Monday to Friday, 9am to 5pm and they can confirm "
         "the exact price for the model you want. Would you like a callback?"
     ), "a long non-pitch reply was read as the pitch"
+    # The model slips into written form sometimes. A miss here leaves the
+    # pre-pitch prompt in place after the pitch, which is the whole bug.
+    for written, label in (
+        (
+            "Bell's Employee Purchase Program gives employees of select "
+            "partner companies 30% off Bell mobility plans and waives "
+            "activation fees. Would you like the store to call you back?",
+            "30%",
+        ),
+        (
+            "Bell's Employee Purchase Program gives employees of select "
+            "partner companies 30 % off Bell mobility plans. Would you like "
+            "the store to call you back?",
+            "30 %",
+        ),
+    ):
+        assert _pitch_delivered(written), (
+            f"pitch written as {label} was not recognised: the pre-pitch "
+            "prompt would survive the pitch"
+        )
 
     # Phase 1 keeps the trigger; phase 2 must not have it, or an unclear turn
     # resurrects the pitch script.
@@ -593,6 +613,21 @@ async def check_pitch_phase_ws():
                 break
         return "".join(tokens).strip()
 
+    async def speak_until(ws, marker):
+        """Read the reply tokens until `marker` has been spoken, then return
+        what was said. Timing-free: the interrupt lands exactly when the
+        caller would have heard the marker, whatever the machine speed."""
+        spoken = ""
+        deadline = asyncio.get_event_loop().time() + 20
+        while marker not in spoken and asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=20)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            spoken += m.get("token") or ""
+        assert marker in spoken, f"the reply never reached {marker!r}: {spoken!r}"
+        return spoken
+
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
         await ws.send(json.dumps(setup))
         await asyncio.sleep(0.5)
@@ -619,17 +654,12 @@ async def check_pitch_phase_ws():
         await ws.send(
             json.dumps({"type": "prompt", "voicePrompt": "pitchme", "last": True})
         )
-        await asyncio.sleep(1.2)
+        spoken = await speak_until(ws, "30 percent")
         await ws.send(
             json.dumps(
                 {
                     "type": "interrupt",
-                    "utteranceUntilInterrupt": (
-                        "Bell's Employee Purchase Program, or EPP, gives "
-                        "employees of select partner companies up to 30 "
-                        "percent off Bell mobility plans and waives "
-                        "activation fees."
-                    ),
+                    "utteranceUntilInterrupt": spoken,
                 }
             )
         )
@@ -643,6 +673,62 @@ async def check_pitch_phase_ws():
             f"an interrupted pitch left the call in the pre-pitch phase: {after!r}"
         )
     print("PITCH PHASE SWAP (interrupted): pass — a cut-in pitch still counts")
+
+    # A reconnect must not restore the pre-pitch prompt. This holds because
+    # _swap_to_after_pitch mutates history[0] in place on the list stored in
+    # SESSIONS; the test guards that contract, so a future rewrite that
+    # rebuilds the list instead of mutating it fails here.
+    setup3 = dict(SETUP)
+    setup3["callSid"] = "CAtest0000000000000000000000000012"
+    setup3["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup3))
+        await asyncio.sleep(0.5)
+        pitch = await say(ws, "pitchme")
+        assert "Employee Purchase Program" in pitch, f"no pitch spoken: {pitch!r}"
+    setup3_r = dict(setup3)
+    setup3_r["connectionType"] = "reconnect"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup3_r))
+        await asyncio.sleep(0.5)
+        after = await say(ws, "pitchref")
+        assert "post-pitch prompt is in place" in after, (
+            f"a reconnect restored the pre-pitch prompt: {after!r}"
+        )
+    print("PITCH PHASE SWAP (reconnect): pass — the phase survives a reconnect")
+
+    # Twilio normalises numbers, so utteranceUntilInterrupt can fail to match
+    # the spoken text verbatim. An empty `heard` means we cannot tell what the
+    # caller heard; re-pitching is the worse failure, so the phase must still
+    # advance from what was spoken.
+    setup4 = dict(SETUP)
+    setup4["callSid"] = "CAtest0000000000000000000000000013"
+    setup4["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup4))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "pitchme", "last": True})
+        )
+        await speak_until(ws, "30 percent")
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "interrupt",
+                    "utteranceUntilInterrupt": "thirty percent off bell plans",
+                }
+            )
+        )
+        try:
+            while True:
+                await asyncio.wait_for(ws.recv(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        after = await say(ws, "pitchref")
+        assert "post-pitch prompt is in place" in after, (
+            f"an unmatched interrupt utterance left the call pre-pitch: {after!r}"
+        )
+    print("PITCH PHASE SWAP (unmatched utterance): pass — falls back to spoken")
 
 
 async def main():

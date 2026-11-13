@@ -202,11 +202,29 @@ def is_dead_end(reply: str) -> bool:
 def _pitch_delivered(reply: str) -> bool:
     """True when this text is the EPP pitch, so the post-pitch prompt should
     take over. Matches on the pitch's own claims rather than on length alone,
-    so a long answer about something else does not trip it."""
+    so a long answer about something else does not trip it.
+
+    Both spellings of the discount count: the model writes "30 percent" when
+    speaking but "30%" when it slips into written form, and a miss here means
+    the pre-pitch prompt survives the pitch.
+    """
     t = (reply or "").lower()
     if len(t) < REPEAT_MIN_CHARS:
         return False
-    return "activation fee" in t or "30 percent" in t
+    return any(
+        claim in t
+        for claim in ("activation fee", "30 percent", "30%", "30 %")
+    )
+
+
+def _after_pitch_prompt() -> str:
+    """The phase-2 outbound system prompt, with the EPP offers injected."""
+    return with_offers(
+        _env_or(
+            "RELAY_OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH",
+            OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH,
+        )
+    )
 
 
 def _swap_to_after_pitch(history: list, state: dict, call_sid: str) -> None:
@@ -218,15 +236,7 @@ def _swap_to_after_pitch(history: list, state: dict, call_sid: str) -> None:
     if state["pitch_delivered"]:
         return
     state["pitch_delivered"] = True
-    history[0] = {
-        "role": "system",
-        "content": with_offers(
-            _env_or(
-                "RELAY_OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH",
-                OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH,
-            )
-        ),
-    }
+    history[0] = {"role": "system", "content": _after_pitch_prompt()}
     log_event("pitch_delivered", callSid=call_sid)
 
 
@@ -1872,8 +1882,20 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 # before cutting in. If so the call is past the
                                 # pitch even though the reply never completed,
                                 # and the pre-pitch prompt must not come back.
-                                if is_outbound and _pitch_delivered(heard):
+                                # Check what was SPOKEN as well as what was
+                                # heard: `heard` is a best-effort truncation and
+                                # comes back short (or empty) when the utterance
+                                # does not match verbatim, which Twilio does to
+                                # numbers. Re-pitching is the worse failure.
+                                if is_outbound and (
+                                    _pitch_delivered(heard)
+                                    or _pitch_delivered(spoken_box[0])
+                                ):
                                     _swap_to_after_pitch(history, state, call_sid)
+                                    # The swap happens after the turn's
+                                    # save_call_state(), so persist it here or a
+                                    # reconnect restores pitch_delivered=False.
+                                    save_call_state()
                                 reply = ""
                                 break
                             elif live.get("type") == "dtmf":
