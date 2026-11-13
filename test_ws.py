@@ -108,6 +108,33 @@ def check_repeat_guard():
     print("REPEAT GUARD CHECKS: pass")
 
 
+def check_name_extraction():
+    """extract_name must not read an "I'm <state>" reply as a name. A live
+    call captured "Listening" from "I'm listening." and logged a
+    CALLBACK_REQUEST for a person who does not exist."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import extract_name
+
+    for utterance in (
+        "I'm listening.",
+        "I'm still here.",
+        "I'm waiting.",
+        "I'm good.",
+        "I'm fine, thanks.",
+        "I'm just checking.",
+        "I'm not sure.",
+        "I'm here.",
+    ):
+        assert extract_name(utterance) is None, (
+            f"extract_name read a state reply as a name: {utterance!r} -> "
+            f"{extract_name(utterance)!r}"
+        )
+    assert extract_name("My name is Don") == "Don"
+    assert extract_name("I'm Don") == "Don"
+    assert extract_name("This is Jonathan") == "Jonathan"
+    print("NAME EXTRACTION CHECKS: pass")
+
+
 def check_signature_validator():
     """Verify server.validate against an independently computed HMAC-SHA1."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -574,6 +601,7 @@ async def main():
         await ws4.close()
 
     check_signature_validator()
+    check_name_extraction()
     check_truncation()
     check_affirmative()
     check_repeat_guard()

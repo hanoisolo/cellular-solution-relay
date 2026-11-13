@@ -515,6 +515,14 @@ NAME_STOPWORDS = {
     "just", "here", "not", "glad", "happy", "sorry", "afraid", "new",
     "from", "with", "regarding", "about", "concerning", "for", "to",
     "me", "i", "we", "it", "this", "that",
+    # "I'm <state>" replies are not names. A live call captured "Listening"
+    # as the caller's name from "I'm listening.", and the store would have
+    # been sent a callback request for a person who does not exist.
+    "listening", "still", "there", "fine", "good", "okay", "ok", "alright",
+    "well", "right", "correct", "sure", "waiting", "back", "done", "ready",
+    "speaking", "talking", "going", "doing", "having", "checking", "asking",
+    "saying", "telling", "actually", "currently", "now", "home", "busy",
+    "available", "curious", "confused", "satisfied", "done",
 }
 NAME_RES = [
     re.compile(r"\bmy name is ([a-z]+(?: [a-z]+)?)", re.IGNORECASE),
@@ -1636,9 +1644,15 @@ async def relay_ws(websocket: WebSocket) -> None:
                     )
                     if is_repeat(prev_assistant, reply.strip()):
                         log_event("repeat_guard", callSid=call_sid)
+                        # The model looped its own last line, which almost
+                        # always means it did not understand the caller. Ask
+                        # for a repeat: the old fallback jumped to a callback
+                        # offer, which on a live call derailed the name
+                        # capture ("I'm listening." -> "would you like the
+                        # store to call you back?").
                         reply = (
-                            "Understood — would you like the store to call you "
-                            "back with the details?"
+                            "Sorry, I didn't catch that — could you say it "
+                            "again?"
                         )
                     log_event(
                         "turn_done",
