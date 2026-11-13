@@ -1810,6 +1810,112 @@ async def check_closing_repeat_ws():
     print("CLOSING REPEAT: pass — a sign-off is never replaced")
 
 
+async def check_handoff_routing_ws():
+    """End-to-end: the caller's request decides which extension the store's
+    line is dialled with.
+
+    The relay cannot transfer a call itself, so it ends the session with the
+    destination in handoffData and /handoff dials the store with that extension
+    as DTMF. This asserts the destination the relay chose, which is the half of
+    the contract the WS side owns; test_sms.py asserts the TwiML that dials it.
+    """
+    from server import DEFAULT_HANDOFF_ROUTE  # noqa: E402
+
+    async def _handoff_for(utterance, direction="inbound"):
+        setup = dict(SETUP)
+        setup["callSid"] = "CAroute" + str(abs(hash(utterance)) % 10**20).zfill(20)
+        setup["direction"] = direction
+        async with websockets.connect(WS_URL, max_size=2**20) as ws:
+            await ws.send(json.dumps(setup))
+            await asyncio.sleep(0.5)
+            await ws.send(
+                json.dumps(
+                    {"type": "prompt", "voicePrompt": utterance, "last": True}
+                )
+            )
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                except asyncio.TimeoutError:
+                    # The stream went quiet without an "end": the relay kept
+                    # talking, which is the answer for a non-handoff turn.
+                    return None
+                m = json.loads(raw)
+                if m.get("type") == "end":
+                    return json.loads(m.get("handoffData") or "{}")
+            return None
+
+    # Each destination the store gave us, reached by the phrase a caller would
+    # actually use. A name alone is enough: "is Neelam there?" never says
+    # "representative", and the old gate would have answered it instead.
+    for utterance, extension, label in (
+        ("Can I speak to a representative about EPP?", "225", "our Bell EPP desk"),
+        ("Is Neelam there?", "226", "Neelam"),
+        ("Can you transfer me to Dwayne please", "232", "Dwayne"),
+        ("I need to speak with Ed", "231", "Ed"),
+        ("This is about accounts receivable", "220", "accounts receivable"),
+        ("Calling about accounts payable", "220", "accounts receivable"),
+    ):
+        hd = await _handoff_for(utterance)
+        assert hd is not None, f"no handoff for {utterance!r}"
+        route = hd.get("route") or {}
+        assert route.get("extension") == extension, (
+            f"{utterance!r} routed to {route!r}, expected extension {extension}"
+        )
+        assert route.get("label") == label, (
+            f"{utterance!r} label is {route.get('label')!r}, expected {label!r}"
+        )
+        assert hd.get("reason") == "caller-requested-human", hd
+    print("HANDOFF ROUTING: pass — each destination gets its own extension")
+
+    # A sales question must not be routed anywhere: the model answers it.
+    for utterance in (
+        "What is the monthly payment on the iPhone 17?",
+        "How much is my phone bill?",
+    ):
+        hd = await _handoff_for(utterance)
+        assert hd is None, f"{utterance!r} was routed to the store: {hd}"
+    print("HANDOFF ROUTING (no false positive): pass — sales questions stay")
+
+    # Outbound: a prospect who says a name is not asking to be transferred to
+    # that person. Only the default applies, and only on a real request.
+    hd = await _handoff_for("Is Neelam there?", direction="outbound-api")
+    assert hd is None, f"an outbound call was routed to a named person: {hd}"
+    hd = await _handoff_for(
+        "Can I speak to a representative?", direction="outbound-api"
+    )
+    assert hd is not None, "an outbound request for a person did not hand off"
+    assert (hd.get("route") or {}).get("extension") == DEFAULT_HANDOFF_ROUTE[0], (
+        f"an outbound handoff did not use the default route: {hd}"
+    )
+    print("HANDOFF ROUTING (outbound): pass — default only, never a named person")
+
+    # DTMF 0 is "press 0 for an operator": it must land on the default desk,
+    # not on a bare store line with no extension.
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000040"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        for _ in range(3):  # greeting, disclosure, question
+            await asyncio.wait_for(ws.recv(), timeout=10)
+        await ws.send(json.dumps({"type": "dtmf", "digit": "0"}))
+        hd = None
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") == "end":
+                hd = json.loads(m.get("handoffData") or "{}")
+                break
+        assert hd is not None, "no end message on DTMF 0"
+        assert hd.get("reason") == "dtmf-0", hd
+        assert (hd.get("route") or {}).get("extension") == DEFAULT_HANDOFF_ROUTE[0], (
+            f"DTMF 0 did not use the default route: {hd}"
+        )
+    print("HANDOFF ROUTING (dtmf 0): pass — operator lands on the default desk")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -2271,6 +2377,7 @@ async def main():
     await check_name_escape_hatch_ws()
     await check_callback_done_note_ws()
     await check_closing_repeat_ws()
+    await check_handoff_routing_ws()
     print("\nALL TESTS PASSED")
 
 

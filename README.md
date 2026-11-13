@@ -203,9 +203,39 @@ dashboard job:
 
 - No email on callback capture (SMS alert only, if `STORE_SMS_NUMBER` is set;
   otherwise logs only).
-- No transfer to a human (no `<Dial>` handoff yet — the `end` message with
-  `handoffData` is supported by the protocol but not wired to a transfer).
 - No Net2Phone integration (paused at the user's request).
+
+## Call routing (inbound handoff)
+
+When an inbound caller asks for a person, or for one of the destinations below,
+the relay ends the session with the destination in `handoffData` and `/handoff`
+dials `RELAY_STORE_NUMBER` with the extension as DTMF
+(`<Number sendDigits="ww225">`). The `ww` is a one-second pause so the store's
+auto-attendant can answer before it takes digits.
+
+| Caller asks for | Extension | Spoken line |
+| :--- | :--- | :--- |
+| A live agent about EPP, Bell promotions, or support (the default) | 225 | "Connecting you to our Bell EPP desk now." |
+| Neelam | 226 | "Connecting you to Neelam now." |
+| Dwayne | 232 | "Connecting you to Dwayne now." |
+| Ed | 231 | "Connecting you to Ed now." |
+| Accounts receivable / payable, invoices, A/R, A/P | 220 | "Connecting you to accounts receivable now." |
+
+Rules that matter:
+
+- **A name beats a department.** "I need Ed in accounts payable" goes to Ed.
+- **The accounts patterns are narrow on purpose.** "billing" and "payment" are
+  not matched, so a prospect asking "what's the monthly payment?" is answered
+  by the agent instead of being sent to accounts receivable.
+- **Outbound calls only ever use the default.** A prospect who happens to say a
+  staff member's name is not asking to be transferred to them.
+- **DTMF 0** ("press 0 for an operator") uses the default desk.
+- The extension is validated before it reaches TwiML (digits only, 1-6 long),
+  so a malformed `handoffData` can never inject markup or dial stray digits.
+
+The table lives in `HANDOFF_ROUTES` in `server.py`. Changing a destination is a
+one-line edit there; `test_sms.py` asserts the exact set of extensions, so a
+typo fails the gate rather than dialling a wrong number.
 
 ## Changing the agent's wording without touching code
 
