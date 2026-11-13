@@ -671,7 +671,33 @@ async def check_idle_prompt():
         assert msg.get("interruptible") is True, (
             f"idle prompt must be interruptible: {msg}"
         )
-    print("IDLE PROMPT: pass — caller silence is answered, not left dead")
+        # A caller who is thinking, not gone, gets one softer second prompt —
+        # and then silence. Repeating "Are you still there?" at someone who is
+        # deciding sounds like a machine checking the line.
+        from server import IDLE_TEXT_2  # noqa: E402
+
+        second_text = os.environ.get("RELAY_IDLE_TEXT_2") or IDLE_TEXT_2
+        raw = await asyncio.wait_for(ws.recv(), timeout=idle_after + 8)
+        second = json.loads(raw)
+        print("RECV (idle 2):", json.dumps(second)[:200])
+        assert second.get("type") == "text" and second.get("last") is True, (
+            f"second idle prompt must be a final text token: {second}"
+        )
+        assert second.get("token") == second_text, (
+            f"unexpected second idle prompt: {second.get('token')!r}"
+        )
+        assert second.get("token") != msg.get("token"), (
+            "the second idle prompt repeated the first one verbatim"
+        )
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=idle_after + 4)
+            third = json.loads(raw)
+            raise AssertionError(
+                f"a third idle prompt was spoken; two is the cap: {third}"
+            )
+        except asyncio.TimeoutError:
+            pass
+    print("IDLE PROMPT: pass — silence is answered twice, then left alone")
 
 
 async def check_reconnect_state():

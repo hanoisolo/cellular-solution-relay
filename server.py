@@ -121,8 +121,16 @@ RECORDING_DISCLOSURE = (
 # on silence, so without this the call sits in dead air until the caller hangs
 # up. Armed only after the caller has spoken once: before that the opening is
 # still playing and a prompt would talk over it. Runtime-overridable with
-# RELAY_IDLE_AFTER (seconds, 0 disables) and RELAY_IDLE_TEXT.
+# RELAY_IDLE_AFTER (seconds, 0 disables), RELAY_IDLE_TEXT and
+# RELAY_IDLE_TEXT_2.
 IDLE_TEXT = "Are you still there?"
+# Second prompt, after the first one drew no answer. Softer and with no
+# question mark: repeating "Are you still there?" at a caller who is thinking
+# sounds like a machine checking a line, and a third prompt is nagging.
+IDLE_TEXT_2 = "Take your time. I'm here whenever you're ready."
+# Prompts per caller turn. Two, then the relay waits in silence: a caller who
+# has not answered twice is either gone or does not want to talk.
+IDLE_PROMPTS_MAX = 2
 
 # How long the caller keeps hearing a reply after the relay has finished
 # SENDING it. ConversationRelay reports no playback-completion event — the
@@ -1387,9 +1395,9 @@ async def relay_ws(websocket: WebSocket) -> None:
     ack_index = 0
     last_ack_at = 0.0
     # Idle prompt: armed once the caller has spoken, so it can never talk over
-    # the opening. At most one prompt per caller turn.
+    # the opening. At most IDLE_PROMPTS_MAX prompts per caller turn.
     caller_spoke = False
-    idle_prompted = False
+    idle_prompts = 0
     # When the caller will stop hearing the agent, estimated from the text
     # sent. The idle timer counts from here, not from send-complete.
     agent_speaking_until = 0.0
@@ -1608,28 +1616,36 @@ async def relay_ws(websocket: WebSocket) -> None:
         caller has gone quiet.
 
         The pending receive is kept rather than cancelled when the timer
-        fires, so a message that lands at the same instant is not dropped.
-        The timer only arms after the caller has spoken once: before that the
-        opening is still playing and a prompt would talk over it.
+        fires, so a message that lands at the same instant is not dropped, and
+        it is reused across prompts: the websockets library forbids two
+        concurrent receives. The timer only arms after the caller has spoken
+        once: before that the opening is still playing and a prompt would talk
+        over it.
         """
-        nonlocal idle_prompted
+        nonlocal idle_prompts
         idle_after = float(os.environ.get("RELAY_IDLE_AFTER", "8") or 0)
-        if idle_after <= 0 or not caller_spoke or idle_prompted:
+        if idle_after <= 0 or not caller_spoke or idle_prompts >= IDLE_PROMPTS_MAX:
             return await websocket.receive_json()
-        # Count from when the caller stops HEARING the agent, not from when the
-        # text was sent: a 505-char pitch needs ~39s of audio, and the old
-        # timer fired 8s after send, so the agent said "Are you still there?"
-        # over its own pitch (live call CA7d8e6e).
-        wait = idle_after + max(0.0, agent_speaking_until - time.monotonic())
         recv = asyncio.ensure_future(websocket.receive_json())
-        done, _pending = await asyncio.wait({recv}, timeout=wait)
-        if not done:
-            idle_prompted = True
-            text = os.environ.get("RELAY_IDLE_TEXT", "") or IDLE_TEXT
+        while True:
+            # Count from when the caller stops HEARING the agent, not from when
+            # the text was sent: a 505-char pitch needs ~39s of audio, and the
+            # old timer fired 8s after send, so the agent said "Are you still
+            # there?" over its own pitch (live call CA7d8e6e).
+            wait = idle_after + max(0.0, agent_speaking_until - time.monotonic())
+            done, _pending = await asyncio.wait({recv}, timeout=wait)
+            if done:
+                return recv.result()
+            idle_prompts += 1
+            if idle_prompts == 1:
+                text = os.environ.get("RELAY_IDLE_TEXT", "") or IDLE_TEXT
+            else:
+                text = os.environ.get("RELAY_IDLE_TEXT_2", "") or IDLE_TEXT_2
             await send_speech(text, True, True, "idle")
-            log_event("idle_prompt", callSid=call_sid, text=text)
-            await asyncio.wait({recv})
-        return recv.result()
+            log_event("idle_prompt", callSid=call_sid, text=text, n=idle_prompts)
+            if idle_prompts >= IDLE_PROMPTS_MAX:
+                # Out of prompts: wait for the caller with no timer running.
+                return await recv
 
     try:
         while True:
@@ -1733,7 +1749,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                 t_prompt = time.monotonic()
                 # The caller is talking again: re-arm the idle prompt.
                 caller_spoke = True
-                idle_prompted = False
+                idle_prompts = 0
                 state["caller_turns"] += 1
                 history.append({"role": "user", "content": user_text})
 
