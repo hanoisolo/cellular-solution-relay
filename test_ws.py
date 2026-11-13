@@ -872,6 +872,52 @@ async def main():
         print("INTERRUPT NOTE: pass — model told not to repeat after a cut-in")
         await ws7.close()
 
+    # The same reply twice in a row must be replaced before it is spoken. A
+    # live call re-emitted the same 364-char pitch after an interrupt; the
+    # truncated assistant turn in history no longer looks like a completed
+    # pitch, so the gate compares against state["last_reply"] instead.
+    async def _collect(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text":
+                continue
+            if m.get("interruptible") is False:
+                continue  # the outbound greeting and the recording notice
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup8 = dict(SETUP)
+    setup8["callSid"] = "CAtest0000000000000000000000000007"
+    setup8["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws8:
+        await ws8.send(json.dumps(setup8))
+        await asyncio.sleep(0.5)
+        await ws8.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "Tell me about EPP.", "last": True}
+            )
+        )
+        first = await _collect(ws8)
+        assert "Employee Purchase Program" in first, first
+        await ws8.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "Tell me about EPP.", "last": True}
+            )
+        )
+        second = await _collect(ws8)
+        assert second != first, f"the same reply was spoken twice: {second!r}"
+        assert second in (
+            "Sorry, I didn't catch that — could you say it again?",
+            "I'm having trouble hearing you. Could you say that once more?",
+        ), second
+        print("PRE-SPEECH REPEAT GUARD: pass — a repeated reply is replaced")
+        await ws8.close()
+
     check_signature_validator()
     check_name_extraction()
     check_truncation()

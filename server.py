@@ -199,12 +199,20 @@ def is_dead_end(reply: str) -> bool:
     return len(t.split()) <= DEAD_END_MAX_WORDS
 
 
-def _gate_commits(partial: str) -> bool:
+def _gate_commits(partial: str, prev_reply: str = "") -> bool:
     """True once a reply being generated is past the point where it could be
-    a dead end: it asks a question, or it runs longer than a dead end."""
+    a dead end or a repeat of the previous reply."""
     t = (partial or "").strip()
     if not t:
         return False
+    # Still tracking the previous reply word for word: it may be a repeat, so
+    # keep holding until it diverges. This is what catches the model
+    # re-emitting a pitch after an interrupt, where the truncated assistant
+    # turn in history no longer looks like a completed pitch.
+    if prev_reply:
+        p, c = _norm_text(prev_reply), _norm_text(t)
+        if p and c and (p.startswith(c) or c.startswith(p)):
+            return False
     return "?" in t or len(t.split()) > DEAD_END_MAX_WORDS
 
 
@@ -509,6 +517,7 @@ def new_call_state() -> dict:
         "recording_disclosed": False,
         "caller_turns": 0,
         "interrupted": False,
+        "last_reply": "",
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -1211,7 +1220,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         )
 
     async def send_text_tokens(
-        reply_stream, spoken_box=None, prev_assistant="", closing=False
+        reply_stream, spoken_box=None, prev_assistant="", prev_reply="", closing=False
     ) -> str:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -1335,7 +1344,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         pending += token
                     else:
                         gate += token
-                        if _gate_commits(gate):
+                        if _gate_commits(gate, prev_reply):
                             committed = True
                             pending += gate
                             gate = ""
@@ -1346,15 +1355,23 @@ async def relay_ws(websocket: WebSocket) -> None:
         except asyncio.CancelledError:
             raise
         if not committed:
-            # The stream ended while the reply was still short and had no
-            # question in it: a dead end. Replace it before anything is
-            # spoken, unless the caller is already wrapping up.
-            if not closing and is_dead_end(gate):
+            # The stream ended while the reply was still held: either it is a
+            # repeat of the previous reply, or it is a dead end. Replace it
+            # before anything is spoken.
+            replacement = None
+            if prev_reply and is_repeat(prev_reply, gate):
+                log_event("repeat_guard", callSid=call_sid, text=gate.strip())
+                replacement = REPEAT_FALLBACKS[0]
+                if _norm_text(prev_reply) == _norm_text(replacement):
+                    replacement = REPEAT_FALLBACKS[1]
+            elif not closing and is_dead_end(gate):
                 log_event("dead_end_guard", callSid=call_sid, text=gate.strip())
-                full = DEAD_END_RECOVERIES[0]
-                if _norm_text(prev_assistant) == _norm_text(full):
-                    full = DEAD_END_RECOVERIES[1]
-                await _flush(full)
+                replacement = DEAD_END_RECOVERIES[0]
+                if _norm_text(prev_reply) == _norm_text(replacement):
+                    replacement = DEAD_END_RECOVERIES[1]
+            if replacement is not None:
+                full = replacement
+                await _flush(replacement)
                 gate = ""
             pending += gate
         await _flush(pending)
@@ -1705,6 +1722,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             mistral_stream_reply(history),
                             spoken_box,
                             prev_assistant=prev_assistant,
+                            prev_reply=state["last_reply"],
                             closing=closing,
                         )
                     )
@@ -1807,6 +1825,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                     llm_task = None
 
                 if reply:
+                    # What the caller actually heard, kept for the pre-speech
+                    # gate on the next turn. History cannot serve this: an
+                    # interrupt truncates the assistant turn to the fragment
+                    # the caller heard, so the full reply is lost there.
+                    state["last_reply"] = reply.strip()
                     if is_repeat(prev_assistant, reply.strip()):
                         # History-level backstop only: the caller has already
                         # heard this reply, so this keeps the model from
