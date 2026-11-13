@@ -199,18 +199,50 @@ def is_dead_end(reply: str) -> bool:
     return len(t.split()) <= DEAD_END_MAX_WORDS
 
 
-def _gate_commits(partial: str, prev_reply: str = "") -> bool:
+def _pitch_delivered(reply: str) -> bool:
+    """True when this text is the EPP pitch, so the post-pitch prompt should
+    take over. Matches on the pitch's own claims rather than on length alone,
+    so a long answer about something else does not trip it."""
+    t = (reply or "").lower()
+    if len(t) < REPEAT_MIN_CHARS:
+        return False
+    return "activation fee" in t or "30 percent" in t
+
+
+def _swap_to_after_pitch(history: list, state: dict, call_sid: str) -> None:
+    """Move the call past the pitch: flag it and replace the system prompt with
+    the post-pitch one, which carries no pitch script and no "go straight into
+    the pitch" trigger. Idempotent, so the reply path and the interrupt path
+    can both call it.
+    """
+    if state["pitch_delivered"]:
+        return
+    state["pitch_delivered"] = True
+    history[0] = {
+        "role": "system",
+        "content": with_offers(
+            _env_or(
+                "RELAY_OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH",
+                OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH,
+            )
+        ),
+    }
+    log_event("pitch_delivered", callSid=call_sid)
+
+
+def _gate_commits(partial: str, recent_replies=()) -> bool:
     """True once a reply being generated is past the point where it could be
-    a dead end or a repeat of the previous reply."""
+    a dead end or a repeat of a recent reply."""
     t = (partial or "").strip()
     if not t:
         return False
-    # Still tracking the previous reply word for word: it may be a repeat, so
-    # keep holding until it diverges. This is what catches the model
-    # re-emitting a pitch after an interrupt, where the truncated assistant
-    # turn in history no longer looks like a completed pitch.
-    if prev_reply:
-        p, c = _norm_text(prev_reply), _norm_text(t)
+    # Still tracking a recent reply word for word: it may be a repeat, so keep
+    # holding until it diverges. This is what catches the model re-emitting a
+    # pitch after an interrupt, where the truncated assistant turn in history
+    # no longer looks like a completed pitch.
+    c = _norm_text(t)
+    for prev in recent_replies:
+        p = _norm_text(prev)
         if p and c and (p.startswith(c) or c.startswith(p)):
             return False
     return "?" in t or len(t.split()) > DEAD_END_MAX_WORDS
@@ -229,6 +261,11 @@ def _norm_text(s: str) -> str:
 REPEAT_MIN_CHARS = 80
 REPEAT_SIMILARITY = 0.85
 REPEAT_MIN_BLOCK = 150
+
+# How many recent replies the pre-speech gate compares against. One is not
+# enough: a live call re-spoke the pitch two turns after the first one, with a
+# short "Sorry, I didn't catch that" fallback in between.
+RECENT_REPLIES_KEPT = 3
 
 # Spoken in place of a reply the model looped. Two variants, so the guard
 # never answers a loop with a loop of its own.
@@ -261,7 +298,12 @@ def is_repeat(prev: str, cur: str) -> bool:
         return True
     return matcher.find_longest_match(0, len(p), 0, len(c)).size >= REPEAT_MIN_BLOCK
 
-OUTBOUND_SYSTEM_PROMPT = (
+# Shared by both outbound phases. The ONLY difference between them is whether
+# the pitch script is still available: once the pitch has been spoken, the
+# "go straight into the pitch" trigger has to go, or the model re-pitches on
+# every unclear turn. A live call re-emitted the same 316-char pitch on
+# "Hello." because that trigger outranked "give the pitch ONCE".
+_OUTBOUND_IDENTITY = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
     "dealer at 81 Zenway Blvd, Unit 6, Vaughan, Ontario. Store hours are "
     "Monday to Friday, 9am to 5pm. Store phone: 905-264-2228. "
@@ -269,24 +311,16 @@ OUTBOUND_SYSTEM_PROMPT = (
     "greeting already introduced you as one, so do not repeat the disclosure "
     "at all. "
     "YOU called this person; they did not call you. Never say 'thanks for "
-    "calling' and never ask 'how can I help you' as an opening — you called "
-    "about Bell's Employee Purchase Program, known as EPP: up to 30 percent "
-    "off Bell mobility plans and no activation fees. When the person says "
-    "yes to having a minute, go straight into the EPP pitch — do not ask "
-    "'do you want to know about EPP' or any other permission question "
-    "first. If the person's first reply is unclear, garbled, or just a "
-    "greeting like 'hello', do NOT ask the minute question again — the "
-    "greeting already asked it. Go straight into the pitch. "
-    "Give the pitch ONCE. After you have given it, never give it again, "
-    "not even reworded: if the person is still unclear, repeats a "
-    "greeting, or says they are listening, ask one specific question "
-    "instead — for example whether they would like the store to call "
-    "them back. "
-    "EPP is for employees of "
-    "select partner companies — NOT only Bell employees. Never say someone "
-    "has to work for Bell, and never ask if they are a Bell employee. To "
-    "check eligibility, tell the person to visit cellular solution dot c a, "
-    "click Employee Offers, and type in their "
+    "calling' and never ask 'how can I help you' as an opening. "
+)
+
+_OUTBOUND_EPP_FACTS = (
+    "Bell's Employee Purchase Program, known as EPP, gives up to 30 percent "
+    "off Bell mobility plans and no activation fees. "
+    "EPP is for employees of select partner companies — NOT only Bell "
+    "employees. Never say someone has to work for Bell, and never ask if they "
+    "are a Bell employee. To check eligibility, tell the person to visit "
+    "cellular solution dot c a, click Employee Offers, and type in their "
     "company name — if their company comes up, they are eligible. Proof of "
     "employment is shown after ordering. "
     "If the person asks for an 'EPP department' or any department or person "
@@ -310,9 +344,7 @@ OUTBOUND_SYSTEM_PROMPT = (
     "Never close a sale and never take an order. "
     "When the person shows interest, offer a callback from the store right "
     "away and collect their name and phone number conversationally, one "
-    "question at a time. After the pitch, the callback offer is always your "
-    "next step — do not stall. End your pitch by offering the callback, "
-    "not by asking whether their company offers EPP. "
+    "question at a time. "
     "Never repeat a phone number back until the caller has given all 10 "
     "digits. Callers often give the number in pieces, so wait patiently "
     "until you have the complete number. If the caller says they are not "
@@ -324,6 +356,39 @@ OUTBOUND_SYSTEM_PROMPT = (
     "complete questions only, never fragments like 'Your company name?'. "
     "Never end the call yourself — only say goodbye after the caller does. "
     "No markdown, no lists, no bullet points, no special characters."
+)
+
+# Phase 1: the pitch has not been given yet.
+OUTBOUND_SYSTEM_PROMPT = (
+    _OUTBOUND_IDENTITY
+    + "You called about Bell's Employee Purchase Program, known as EPP. "
+    "When the person says yes to having a minute, go straight into the EPP "
+    "pitch — do not ask 'do you want to know about EPP' or any other "
+    "permission question first. If the person's first reply is unclear, "
+    "garbled, or just a greeting like 'hello', do NOT ask the minute "
+    "question again — the greeting already asked it. Go straight into the "
+    "pitch. "
+    "Give the pitch ONCE. After you have given it, never give it again, "
+    "not even reworded. "
+    "End your pitch by offering the callback, not by asking whether their "
+    "company offers EPP. "
+    + _OUTBOUND_EPP_FACTS
+)
+
+# Phase 2: the pitch has been spoken. The pitch script and the "go straight
+# into the pitch" trigger are GONE, so an unclear turn cannot resurrect them.
+OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH = (
+    _OUTBOUND_IDENTITY
+    + "You have ALREADY given the EPP pitch on this call. Never give it "
+    "again, not even reworded, and never repeat the website directions. "
+    "If the caller says 'hello', is unclear, or asks what the call is "
+    "about, answer in ONE short sentence — for example 'I'm calling about "
+    "Bell's Employee Purchase Program, which saves eligible employees 30 "
+    "percent on mobility plans' — then ask one specific question, such as "
+    "whether they would like the store to call them back. "
+    "Your next step is the callback offer: ask for their name and the best "
+    "number to reach them at, one question at a time. "
+    + _OUTBOUND_EPP_FACTS
 )
 
 SYSTEM_PROMPT = (
@@ -465,6 +530,18 @@ MOCK_REPLIES = {
     # Report whether the one-shot interrupt note reached the model.
     "note_seen": "Yes, I can see the interrupt note in the history.",
     "note_missing": "No interrupt note was found in the history.",
+    # A pitch, so the phase swap can be exercised end-to-end. Only reachable
+    # in MOCK_LLM mode.
+    "pitch": (
+        "Bell's Employee Purchase Program, or EPP, gives employees of select "
+        "partner companies up to 30 percent off Bell mobility plans and waives "
+        "activation fees. To check if your company is eligible, visit cellular "
+        "solution dot c a, click Employee Offers, and type in your company "
+        "name. Would you like the store to call you back?"
+    ),
+    # Report which outbound prompt phase the model is being given.
+    "pitch_seen": "Yes, the post-pitch prompt is in place.",
+    "pitch_missing": "No, the pre-pitch prompt is still in place.",
 }
 
 
@@ -475,6 +552,15 @@ def _mock_reply_for(history: list[dict]) -> str:
         "",
     )
     lowered = last_user.lower()
+    if "pitchref" in lowered:
+        swapped = any(
+            m.get("role") == "system"
+            and "ALREADY given the EPP pitch" in (m.get("content") or "")
+            for m in history
+        )
+        return MOCK_REPLIES["pitch_seen"] if swapped else MOCK_REPLIES["pitch_missing"]
+    if "pitchme" in lowered:
+        return MOCK_REPLIES["pitch"]
     if "noteref" in lowered:
         seen = any(
             m.get("role") == "system"
@@ -517,7 +603,8 @@ def new_call_state() -> dict:
         "recording_disclosed": False,
         "caller_turns": 0,
         "interrupted": False,
-        "last_reply": "",
+        "recent_replies": [],
+        "pitch_delivered": False,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -801,10 +888,13 @@ async def mistral_stream_reply(
     """Yield reply tokens from Mistral as they arrive (SSE stream)."""
     if MOCK_LLM or os.environ.get("MOCK_LLM", "") == "1":
         reply = _mock_reply_for(history)
-        # Yield word by word so the streaming path is exercised.
+        # Yield word by word so the streaming path is exercised. The pitch
+        # streams slower so a test can interrupt it mid-sentence, the way a
+        # caller cuts in after hearing most of it.
+        delay = 0.03 if reply == MOCK_REPLIES["pitch"] else 0.01
         for word in reply.split(" "):
             yield word + " "
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(delay)
         return
 
     if not MISTRAL_API_KEY:
@@ -1220,7 +1310,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         )
 
     async def send_text_tokens(
-        reply_stream, spoken_box=None, prev_assistant="", prev_reply="", closing=False
+        reply_stream, spoken_box=None, prev_assistant="", recent_replies=(), closing=False
     ) -> str:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -1344,7 +1434,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         pending += token
                     else:
                         gate += token
-                        if _gate_commits(gate, prev_reply):
+                        if _gate_commits(gate, recent_replies):
                             committed = True
                             pending += gate
                             gate = ""
@@ -1356,18 +1446,23 @@ async def relay_ws(websocket: WebSocket) -> None:
             raise
         if not committed:
             # The stream ended while the reply was still held: either it is a
-            # repeat of the previous reply, or it is a dead end. Replace it
-            # before anything is spoken.
+            # repeat of a recent reply, or it is a dead end. Replace it before
+            # anything is spoken.
             replacement = None
-            if prev_reply and is_repeat(prev_reply, gate):
+            repeated = next(
+                (r for r in recent_replies if is_repeat(r, gate)), None
+            )
+            if repeated is not None:
                 log_event("repeat_guard", callSid=call_sid, text=gate.strip())
                 replacement = REPEAT_FALLBACKS[0]
-                if _norm_text(prev_reply) == _norm_text(replacement):
+                if _norm_text(repeated) == _norm_text(replacement):
                     replacement = REPEAT_FALLBACKS[1]
             elif not closing and is_dead_end(gate):
                 log_event("dead_end_guard", callSid=call_sid, text=gate.strip())
                 replacement = DEAD_END_RECOVERIES[0]
-                if _norm_text(prev_reply) == _norm_text(replacement):
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
                     replacement = DEAD_END_RECOVERIES[1]
             if replacement is not None:
                 full = replacement
@@ -1722,7 +1817,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             mistral_stream_reply(history),
                             spoken_box,
                             prev_assistant=prev_assistant,
-                            prev_reply=state["last_reply"],
+                            recent_replies=state["recent_replies"],
                             closing=closing,
                         )
                     )
@@ -1773,6 +1868,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 # re-emits it. A live call repeated the same
                                 # 372-char pitch verbatim on "Hello.".
                                 state["interrupted"] = True
+                                # The caller may have heard the whole pitch
+                                # before cutting in. If so the call is past the
+                                # pitch even though the reply never completed,
+                                # and the pre-pitch prompt must not come back.
+                                if is_outbound and _pitch_delivered(heard):
+                                    _swap_to_after_pitch(history, state, call_sid)
                                 reply = ""
                                 break
                             elif live.get("type") == "dtmf":
@@ -1828,8 +1929,20 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # What the caller actually heard, kept for the pre-speech
                     # gate on the next turn. History cannot serve this: an
                     # interrupt truncates the assistant turn to the fragment
-                    # the caller heard, so the full reply is lost there.
-                    state["last_reply"] = reply.strip()
+                    # the caller heard, so the full reply is lost there. A ring
+                    # of the last few replies, not just the last one: the turn
+                    # between two pitch attempts is often a short fallback, so
+                    # comparing against one reply misses the pitch repeat.
+                    state["recent_replies"].append(reply.strip())
+                    del state["recent_replies"][:-RECENT_REPLIES_KEPT]
+                    if is_outbound and not state["pitch_delivered"] and _pitch_delivered(reply):
+                        # The pitch is now behind us. Swap the system prompt for
+                        # one with no pitch script and no "go straight into the
+                        # pitch" trigger: the pre-pitch prompt tells the model to
+                        # pitch on any unclear first reply, which is exactly what
+                        # made it re-pitch after a "hello". Removing the trigger
+                        # is the fix; another negative rule is not.
+                        _swap_to_after_pitch(history, state, call_sid)
                     if is_repeat(prev_assistant, reply.strip()):
                         # History-level backstop only: the caller has already
                         # heard this reply, so this keeps the model from

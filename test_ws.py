@@ -261,6 +261,81 @@ def check_repeat_guard():
     print("REPEAT GUARD CHECKS: pass")
 
 
+def check_pitch_phase():
+    """The outbound prompt must change phase once the pitch has been spoken.
+
+    A live call (CA253b72be5b160cbbf661c88739a2dbad) re-spoke the same 316-char
+    pitch after the caller said "Hello." again. The pre-speech gate missed it
+    because the turn in between was a short fallback, and the prompt itself was
+    the real cause: it said "give the pitch ONCE" AND "if the first reply is
+    just a greeting like 'hello', go straight into the pitch". The second rule
+    won every time. The fix removes the trigger by swapping the system prompt
+    after the pitch, so the phase-2 prompt must not contain it.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import (
+        OUTBOUND_SYSTEM_PROMPT,
+        OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH,
+        RECENT_REPLIES_KEPT,
+        _pitch_delivered,
+        _swap_to_after_pitch,
+        new_call_state,
+    )
+
+    pitch = (
+        "Bell's Employee Purchase Program, or EPP, gives employees of select "
+        "partner companies up to 30 percent off Bell mobility plans and waives "
+        "activation fees. Would you like the store to call you back?"
+    )
+    assert _pitch_delivered(pitch), "the pitch itself was not recognised as a pitch"
+    assert not _pitch_delivered("Sure."), "a short ack was read as the pitch"
+    assert not _pitch_delivered(
+        "The store is open Monday to Friday, 9am to 5pm and they can confirm "
+        "the exact price for the model you want. Would you like a callback?"
+    ), "a long non-pitch reply was read as the pitch"
+
+    # Phase 1 keeps the trigger; phase 2 must not have it, or an unclear turn
+    # resurrects the pitch script.
+    assert "straight into the pitch" in OUTBOUND_SYSTEM_PROMPT.lower(), (
+        "phase-1 prompt lost the pitch trigger it needs on a 'yes'"
+    )
+    assert "straight into the pitch" not in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH.lower(), (
+        "phase-2 prompt still tells the model to go straight into the pitch: "
+        "an unclear turn will re-pitch"
+    )
+    assert "ALREADY given the EPP pitch" in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH, (
+        "phase-2 prompt does not tell the model the pitch is already given"
+    )
+    assert "Never repeat a previous reply" in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH, (
+        "phase-2 prompt lost the never-repeat-a-reply rule"
+    )
+    # The late-pickup risk: a caller who only starts listening after the pitch
+    # must still be able to learn what the call is about.
+    assert "what the call is about" in OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH, (
+        "phase-2 prompt has no answer for 'what is this call about'"
+    )
+
+    # The swap itself: idempotent, and it replaces history[0] in place.
+    state = new_call_state()
+    assert state["pitch_delivered"] is False, state
+    assert state["recent_replies"] == [], state
+    history = [{"role": "system", "content": OUTBOUND_SYSTEM_PROMPT}]
+    _swap_to_after_pitch(history, state, "CAtest")
+    assert state["pitch_delivered"] is True, "the swap did not flag the phase"
+    assert history[0]["role"] == "system", history[0]
+    assert "ALREADY given the EPP pitch" in history[0]["content"], (
+        "the swap did not install the phase-2 prompt"
+    )
+    history[0]["content"] = "sentinel"
+    _swap_to_after_pitch(history, state, "CAtest")
+    assert history[0]["content"] == "sentinel", "the swap is not idempotent"
+
+    # The gate compares against a ring, not one reply: the turn between two
+    # pitch attempts is often a short fallback.
+    assert RECENT_REPLIES_KEPT >= 3, RECENT_REPLIES_KEPT
+    print("PITCH PHASE CHECKS: pass — the pitch trigger is gone after the pitch")
+
+
 def check_name_extraction():
     """extract_name must not read an "I'm <state>" reply as a name. A live
     call captured "Listening" from "I'm listening." and logged a
@@ -488,6 +563,86 @@ async def check_reconnect_state():
             f"reconnect lost the callback details: {hd}"
         )
     print("RECONNECT STATE: pass — callback details survive a dropped socket")
+
+
+async def check_pitch_phase_ws():
+    """End-to-end: after the pitch is spoken, the model must be handed the
+    phase-2 prompt. The mock reports which phase it sees, so this fails if the
+    swap never happens — the exact condition that let a live call re-pitch."""
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000010"
+    setup["direction"] = "outbound-api"
+
+    async def say(ws, text):
+        await ws.send(json.dumps({"type": "prompt", "voicePrompt": text, "last": True}))
+        acks = {"Sure.", "Go ahead.", "Of course."}
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text":
+                continue
+            if m.get("interruptible") is False:
+                continue  # the outbound greeting and the recording notice
+            tok = m.get("token") or ""
+            if tok.strip() in acks:
+                continue  # the interrupt acknowledgement, spoken on its own
+            tokens.append(tok)
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        before = await say(ws, "pitchref")
+        assert "pre-pitch prompt is still in place" in before, (
+            f"the call did not start in the pre-pitch phase: {before!r}"
+        )
+        pitch = await say(ws, "pitchme")
+        assert "Employee Purchase Program" in pitch, f"no pitch spoken: {pitch!r}"
+        after = await say(ws, "pitchref")
+        assert "post-pitch prompt is in place" in after, (
+            f"the system prompt was not swapped after the pitch: {after!r}"
+        )
+    print("PITCH PHASE SWAP: pass — phase-2 prompt installed after the pitch")
+
+    # An interrupted pitch still counts as delivered: the caller heard the
+    # pitch, so the pre-pitch prompt must not come back on the next turn.
+    setup2 = dict(SETUP)
+    setup2["callSid"] = "CAtest0000000000000000000000000011"
+    setup2["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup2))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "pitchme", "last": True})
+        )
+        await asyncio.sleep(1.2)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "interrupt",
+                    "utteranceUntilInterrupt": (
+                        "Bell's Employee Purchase Program, or EPP, gives "
+                        "employees of select partner companies up to 30 "
+                        "percent off Bell mobility plans and waives "
+                        "activation fees."
+                    ),
+                }
+            )
+        )
+        try:
+            while True:
+                await asyncio.wait_for(ws.recv(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        after = await say(ws, "pitchref")
+        assert "post-pitch prompt is in place" in after, (
+            f"an interrupted pitch left the call in the pre-pitch phase: {after!r}"
+        )
+    print("PITCH PHASE SWAP (interrupted): pass — a cut-in pitch still counts")
 
 
 async def main():
@@ -924,9 +1079,11 @@ async def main():
     check_recording_gate()
     check_dead_end_guard()
     check_repeat_guard()
+    check_pitch_phase()
     check_epp_offers_ws()
     await check_idle_prompt()
     await check_reconnect_state()
+    await check_pitch_phase_ws()
     print("\nALL TESTS PASSED")
 
 

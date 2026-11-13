@@ -85,6 +85,7 @@ curl -s http://localhost:8000/health
 | `RELAY_STT_PROVIDER` | No | Default `Google`, `speechModel=telephony`. |
 | `RELAY_SYSTEM_PROMPT` | No | Inbound voice system prompt sent to Mistral. Default `SYSTEM_PROMPT`. |
 | `RELAY_OUTBOUND_SYSTEM_PROMPT` | No | Outbound voice system prompt. Default `OUTBOUND_SYSTEM_PROMPT`. |
+| `RELAY_OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH` | No | Outbound system prompt swapped in once the EPP pitch has been spoken. Carries no pitch script and no pitch trigger. Default `OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH`. |
 | `RELAY_WELCOME_GREETING` | No | Greeting spoken as a non-interruptible token on inbound setup. Default `WELCOME_GREETING`. |
 | `RELAY_OUTBOUND_GREETING` | No | Greeting spoken on outbound setup. Default `OUTBOUND_GREETING`. |
 | `RELAY_DISCLOSURE` | No | Inbound AI + recording disclosure token. Default `DISCLOSURE`. |
@@ -217,6 +218,7 @@ the next request or redeploy — no code edit needed):
 | `RELAY_OUTBOUND_GREETING` | outbound `welcomeGreeting` (`/twiml-outbound`) | `OUTBOUND_GREETING` |
 | `RELAY_SYSTEM_PROMPT` | inbound system prompt sent to Mistral | `SYSTEM_PROMPT` |
 | `RELAY_OUTBOUND_SYSTEM_PROMPT` | outbound system prompt (ws setup `direction` starts with "outbound") | `OUTBOUND_SYSTEM_PROMPT` |
+| `RELAY_OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH` | outbound system prompt swapped in once the pitch has been spoken | `OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH` |
 | `RELAY_SMS_SYSTEM_PROMPT` | SMS system prompt (`POST /sms`) | `SMS_SYSTEM_PROMPT` |
 | `RELAY_HINTS` | ConversationRelay `hints` attribute (both legs) | `DEFAULT_HINTS` |
 | `RELAY_DISCLOSURE` | inbound AI + recording disclosure token | `DISCLOSURE` |
