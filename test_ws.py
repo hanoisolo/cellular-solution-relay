@@ -356,6 +356,54 @@ def check_pitch_phase():
     print("PITCH PHASE CHECKS: pass — the pitch trigger is gone after the pitch")
 
 
+def check_speech_timing():
+    """The idle timer must count from when the caller stops HEARING the agent.
+
+    ConversationRelay has no playback-completion event, so the relay estimates
+    from the text it sent. Live call CA7d8e6e proved the old behaviour: the
+    505-char pitch needed ~39s of audio and the idle prompt fired 8s after the
+    text was sent, so the agent said "Are you still there?" over its own pitch
+    and the caller heard 23% of it.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import (
+        GREETING_ONLY_RE,
+        SPEECH_CHARS_PER_SEC,
+        estimate_speech_seconds,
+    )
+
+    # Measured on this account's voice: 118 chars played in 9s = 13.1 chars/s.
+    # The constant must be at or below that, so the estimate never undershoots
+    # and the idle prompt can never arrive early.
+    assert SPEECH_CHARS_PER_SEC <= 13.1, (
+        f"speech rate {SPEECH_CHARS_PER_SEC} is faster than the measured "
+        "13.1 chars/s: the idle prompt could fire over the agent's own speech"
+    )
+    assert estimate_speech_seconds("") == 1.0, estimate_speech_seconds("")
+    assert estimate_speech_seconds("x" * 118) > 9.0, (
+        "the estimate for the 118 chars the caller actually heard must exceed "
+        "the 9s it really took"
+    )
+    assert estimate_speech_seconds("x" * 505) > 39.0, (
+        "the estimate for the 505-char pitch must exceed its ~39s of audio"
+    )
+
+    # A bare greeting is not a cut-in worth acknowledging.
+    for text in ("Hello.", "hello", "Hi there", "Uh, yeah.", "Okay.", "Sure."):
+        assert GREETING_ONLY_RE.match(text), (
+            f"{text!r} should be treated as a greeting/filler, not a cut-in"
+        )
+    for text in (
+        "What are your store hours?",
+        "wait, what about the price?",
+        "No, I am busy right now.",
+    ):
+        assert not GREETING_ONLY_RE.match(text), (
+            f"{text!r} is a real turn and must still get an acknowledgement"
+        )
+    print("SPEECH TIMING CHECKS: pass — the idle clock follows playback, not send")
+
+
 def check_name_extraction():
     """extract_name must not read an "I'm <state>" reply as a name. A live
     call captured "Listening" from "I'm listening." and logged a
@@ -515,8 +563,29 @@ async def check_idle_prompt():
                 {"type": "prompt", "voicePrompt": "What are your hours?", "last": True}
             )
         )
-        await collect_until_last(ws)
-        # Now go quiet: the idle prompt must arrive on its own.
+        reply_tokens = await collect_until_last(ws)
+        spoken = "".join(
+            m.get("token") or ""
+            for m in reply_tokens
+            if m.get("type") == "text" and m.get("interruptible") is not False
+        )
+        # The idle clock now starts when the caller stops HEARING the reply,
+        # not when the text was sent. Compute the same estimate the server
+        # uses, so the wait is exact instead of a guess.
+        from server import estimate_speech_seconds  # noqa: E402
+
+        playback = estimate_speech_seconds(spoken)
+        # Now go quiet: the idle prompt must arrive on its own, and must NOT
+        # arrive before the reply has finished playing.
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=max(0.1, playback - 1.0))
+            early = json.loads(raw)
+            raise AssertionError(
+                f"idle prompt fired {playback:.1f}s of audio early, over the "
+                f"agent's own reply: {early}"
+            )
+        except asyncio.TimeoutError:
+            pass
         raw = await asyncio.wait_for(ws.recv(), timeout=idle_after + 8)
         msg = json.loads(raw)
         print("RECV (idle):", json.dumps(msg)[:200])
@@ -729,6 +798,63 @@ async def check_pitch_phase_ws():
             f"an unmatched interrupt utterance left the call pre-pitch: {after!r}"
         )
     print("PITCH PHASE SWAP (unmatched utterance): pass — falls back to spoken")
+
+
+async def check_ack_suppression():
+    """A cut-in is only worth acknowledging when the caller actually cut off a
+    reply, and not when their turn is a bare greeting. Live call CA7d8e6e had
+    the caller say "Hello." and the agent answer "Sure." — a non-sequitur."""
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000014"
+    setup["direction"] = "outbound-api"
+
+    async def say(ws, text):
+        await ws.send(json.dumps({"type": "prompt", "voicePrompt": text, "last": True}))
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await say(ws, "Tell me about EPP.")
+        # Post-stream interrupt: the reply is done, so the ack decision is made
+        # by the speech-kind gate rather than the in-stream branch.
+        await ws.send(json.dumps({"type": "interrupt", "utteranceUntilInterrupt": ""}))
+        await asyncio.sleep(0.2)
+        greeting_reply = await say(ws, "Hello.")
+        assert greeting_reply not in ("Sure.", "Go ahead.", "Of course."), (
+            f"a bare greeting was acknowledged: {greeting_reply!r}"
+        )
+        # A real turn after a cut-in still gets its acknowledgement.
+        await asyncio.sleep(2.2)  # clear INTERRUPT_ACK_COOLDOWN
+        await ws.send(json.dumps({"type": "interrupt", "utteranceUntilInterrupt": ""}))
+        await asyncio.sleep(0.2)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Wait, what about the price?",
+                    "last": True,
+                }
+            )
+        )
+        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        first = json.loads(raw)
+        assert first.get("type") == "text" and first.get("token") in (
+            "Sure.",
+            "Go ahead.",
+            "Of course.",
+        ), f"a real cut-in lost its acknowledgement: {first}"
+    print("ACK SUPPRESSION: pass — no 'Sure.' after 'Hello.', ack kept for real turns")
 
 
 async def main():
@@ -1166,10 +1292,12 @@ async def main():
     check_dead_end_guard()
     check_repeat_guard()
     check_pitch_phase()
+    check_speech_timing()
     check_epp_offers_ws()
     await check_idle_prompt()
     await check_reconnect_state()
     await check_pitch_phase_ws()
+    await check_ack_suppression()
     print("\nALL TESTS PASSED")
 
 

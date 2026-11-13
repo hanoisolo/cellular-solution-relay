@@ -124,6 +124,25 @@ RECORDING_DISCLOSURE = (
 # RELAY_IDLE_AFTER (seconds, 0 disables) and RELAY_IDLE_TEXT.
 IDLE_TEXT = "Are you still there?"
 
+# How long the caller keeps hearing a reply after the relay has finished
+# SENDING it. ConversationRelay reports no playback-completion event — the
+# message set is setup/prompt/dtmf/interrupt/info/error, and `interrupt` only
+# fires on a barge-in — so the relay has to estimate from the text it sent.
+#
+# Measured on this account's Google TTS: on live call CA7d8e6e the caller
+# interrupted 9s into the 505-char EPP pitch and Twilio reported 118 chars
+# played, i.e. 13.1 chars/s. 12.0 is deliberately slower than measured so the
+# estimate never undershoots: an over-estimate makes the idle prompt arrive
+# late (dead air), an under-estimate makes it talk over the agent's own
+# speech, which is what happened on that call.
+SPEECH_CHARS_PER_SEC = 12.0
+SPEECH_PAD_S = 1.0
+
+
+def estimate_speech_seconds(spoken: str) -> float:
+    """Seconds of audio for `spoken`, plus a pad for TTS lead-in."""
+    return len(spoken or "") / SPEECH_CHARS_PER_SEC + SPEECH_PAD_S
+
 # Short acknowledgement spoken when the caller talks over the agent, so the
 # interruption sounds like a person yielding the floor instead of the agent
 # going dead mid-sentence. Spoken on the prompt that FOLLOWS the interrupt,
@@ -136,6 +155,15 @@ INTERRUPT_ACKS = "Sure.|Go ahead.|Of course."
 # Minimum seconds between acknowledgements, so rapid-fire interruptions do
 # not turn into "Sure. Sure. Sure."
 INTERRUPT_ACK_COOLDOWN = 2.0
+
+# A caller turn that is only a greeting or filler. Acknowledging a cut-in with
+# "Sure." is right after "wait, what about the price?" and wrong after
+# "Hello.", which is what a live call produced.
+GREETING_ONLY_RE = re.compile(
+    r"^(uh|um|er|ah|yeah|yes|no|hi|hello|hey|ok|okay|sure|huh|right|so)"
+    r"([,\s]+(there|hello|hi|yeah|ok|okay))?[\s.!?,]*$",
+    re.IGNORECASE,
+)
 
 
 def interrupt_acks() -> list[str]:
@@ -1296,6 +1324,42 @@ async def relay_ws(websocket: WebSocket) -> None:
     # the opening. At most one prompt per caller turn.
     caller_spoke = False
     idle_prompted = False
+    # When the caller will stop hearing the agent, estimated from the text
+    # sent. The idle timer counts from here, not from send-complete.
+    agent_speaking_until = 0.0
+    speech_buffer = ""
+    # What was last spoken: "reply", "idle", "ack", "notice", "opening",
+    # "nudge" or "error". The interrupt acknowledgement only makes sense after
+    # a reply — "Sure." answering a cut-off "Are you still there?" does not.
+    last_speech_kind = ""
+
+    async def send_speech(
+        token: str, last: bool, interruptible: bool, kind: str
+    ) -> float:
+        """Send a text token and track how long the caller will still be
+        hearing it. Every text send goes through here, so the idle timer can
+        wait for playback instead of firing over the agent's own speech.
+        Returns the estimated playback seconds when this closes an utterance.
+        """
+        nonlocal agent_speaking_until, speech_buffer, last_speech_kind
+        await websocket.send_json(
+            {
+                "type": "text",
+                "token": token,
+                "last": last,
+                "interruptible": interruptible,
+                "preemptible": False,
+            }
+        )
+        if token:
+            speech_buffer += token
+        if not last:
+            return 0.0
+        est = estimate_speech_seconds(speech_buffer)
+        agent_speaking_until = time.monotonic() + est
+        last_speech_kind = kind
+        speech_buffer = ""
+        return est
 
     def save_call_state() -> None:
         """Mirror the per-call state into CALL_STATE so a reconnect restores
@@ -1321,10 +1385,11 @@ async def relay_ws(websocket: WebSocket) -> None:
 
     async def send_text_tokens(
         reply_stream, spoken_box=None, prev_assistant="", recent_replies=(), closing=False
-    ) -> str:
+    ) -> tuple[str, float]:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
-        (raw, for history/logs).
+        (raw, for history/logs) and the estimated seconds of audio still to
+        play when the last token was sent.
 
         The holdback is 26 characters: the website ('cellularsolution.ca',
         'www.cellularsolution.ca', 'cellular solution dot c a') is at most
@@ -1384,15 +1449,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # What the caller actually heard so far, for interrupt
                     # truncation (utteranceUntilInterrupt).
                     spoken_box[0] += spoken
-                await websocket.send_json(
-                    {
-                        "type": "text",
-                        "token": spoken,
-                        "last": False,
-                        "interruptible": True,
-                        "preemptible": False,
-                    }
-                )
+                await send_speech(spoken, False, True, "reply")
 
         # Silence nudge: if Mistral takes longer than RELAY_NUDGE_AFTER
         # seconds (default 3) to produce its first token, speak a short
@@ -1419,15 +1476,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     )
                 except asyncio.TimeoutError:
                     log_event("nudge_sent", callSid=call_sid)
-                    await websocket.send_json(
-                        {
-                            "type": "text",
-                            "token": nudge_text,
-                            "last": False,
-                            "interruptible": True,
-                            "preemptible": False,
-                        }
-                    )
+                    await send_speech(nudge_text, False, True, "nudge")
                     token = await nxt
             else:
                 token = await _next_token()
@@ -1480,16 +1529,8 @@ async def relay_ws(websocket: WebSocket) -> None:
                 gate = ""
             pending += gate
         await _flush(pending)
-        await websocket.send_json(
-            {
-                "type": "text",
-                "token": "",
-                "last": True,
-                "interruptible": True,
-                "preemptible": False,
-            }
-        )
-        return full
+        est_playback_s = await send_speech("", True, True, "reply")
+        return full, est_playback_s
 
     async def next_message() -> dict:
         """Receive the next Twilio message, speaking the idle prompt if the
@@ -1504,20 +1545,17 @@ async def relay_ws(websocket: WebSocket) -> None:
         idle_after = float(os.environ.get("RELAY_IDLE_AFTER", "8") or 0)
         if idle_after <= 0 or not caller_spoke or idle_prompted:
             return await websocket.receive_json()
+        # Count from when the caller stops HEARING the agent, not from when the
+        # text was sent: a 505-char pitch needs ~39s of audio, and the old
+        # timer fired 8s after send, so the agent said "Are you still there?"
+        # over its own pitch (live call CA7d8e6e).
+        wait = idle_after + max(0.0, agent_speaking_until - time.monotonic())
         recv = asyncio.ensure_future(websocket.receive_json())
-        done, _pending = await asyncio.wait({recv}, timeout=idle_after)
+        done, _pending = await asyncio.wait({recv}, timeout=wait)
         if not done:
             idle_prompted = True
             text = os.environ.get("RELAY_IDLE_TEXT", "") or IDLE_TEXT
-            await websocket.send_json(
-                {
-                    "type": "text",
-                    "token": text,
-                    "last": True,
-                    "interruptible": True,
-                    "preemptible": False,
-                }
-            )
+            await send_speech(text, True, True, "idle")
             log_event("idle_prompt", callSid=call_sid, text=text)
             await asyncio.wait({recv})
         return recv.result()
@@ -1579,15 +1617,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # defaults to "any"). Speaking it ourselves with
                     # interruptible=false makes the opening uninterruptible.
                     async def _speak_opening(text: str) -> None:
-                        await websocket.send_json(
-                            {
-                                "type": "text",
-                                "token": text,
-                                "last": True,
-                                "interruptible": False,
-                                "preemptible": False,
-                            }
-                        )
+                        await send_speech(text, True, False, "opening")
 
                     await _speak_opening(greeting)
                     if is_outbound:
@@ -1652,19 +1682,15 @@ async def relay_ws(websocket: WebSocket) -> None:
                     interrupted = False
                     acks = interrupt_acks()
                     now = time.monotonic()
+                    # A bare greeting or filler is not a cut-in worth
+                    # acknowledging: "Hello." -> "Sure." sounds broken.
+                    if GREETING_ONLY_RE.match(user_text):
+                        acks = []
                     if acks and now - last_ack_at >= INTERRUPT_ACK_COOLDOWN:
                         ack = acks[ack_index % len(acks)]
                         ack_index += 1
                         last_ack_at = now
-                        await websocket.send_json(
-                            {
-                                "type": "text",
-                                "token": ack,
-                                "last": True,
-                                "interruptible": True,
-                                "preemptible": False,
-                            }
-                        )
+                        await send_speech(ack, True, True, "ack")
                         log_event("interrupt_ack", callSid=call_sid, text=ack)
 
                 # Outbound: speak the recording notice early, non-interruptible.
@@ -1679,15 +1705,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                 ):
                     state["recording_disclosed"] = True
                     notice_to_log = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
-                    await websocket.send_json(
-                        {
-                            "type": "text",
-                            "token": notice_to_log,
-                            "last": True,
-                            "interruptible": False,
-                            "preemptible": False,
-                        }
-                    )
+                    await send_speech(notice_to_log, True, False, "notice")
                     log_event("recording_disclosed", callSid=call_sid)
 
                 # Bare-name reply: the assistant just asked for the name and
@@ -1832,6 +1850,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         )
                     )
                     reply = ""
+                    est_playback_s = 0.0
                     # Race the LLM task against incoming Twilio messages so an
                     # interrupt is handled WHILE the reply is still streaming,
                     # not only after it finished.
@@ -1844,7 +1863,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if llm_task in done:
-                                reply = llm_task.result()
+                                reply, est_playback_s = llm_task.result()
                                 break
                             live = recv_task.result()
                             if live.get("type") == "interrupt":
@@ -1853,6 +1872,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                                     await llm_task
                                 except asyncio.CancelledError:
                                     pass
+                                # Twilio stopped playback at this instant, so
+                                # the estimate is spent.
+                                agent_speaking_until = time.monotonic()
                                 utterance = (live.get("utteranceUntilInterrupt") or "").strip()
                                 # Keep only what the caller heard before cutting
                                 # in, so Mistral never thinks it said things the
@@ -1930,15 +1952,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         "The store can help you at 905-264-2228."
                     )
                     try:
-                        await websocket.send_json(
-                            {
-                                "type": "text",
-                                "token": reply,
-                                "last": True,
-                                "interruptible": True,
-                                "preemptible": False,
-                            }
-                        )
+                        await send_speech(reply, True, True, "error")
                     except (WebSocketDisconnect, RuntimeError):
                         # The caller already hung up; nothing to say it to.
                         pass
@@ -1980,6 +1994,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         callSid=call_sid,
                         ms=round((time.monotonic() - t_prompt) * 1000, 1),
                         chars=len(reply),
+                        est_playback_s=round(est_playback_s, 1),
                     )
                     history.append({"role": "assistant", "content": reply.strip()})
                     if notice_to_log:
@@ -2028,11 +2043,18 @@ async def relay_ws(websocket: WebSocket) -> None:
             elif msg_type == "interrupt":
                 if llm_task is not None and not llm_task.done():
                     llm_task.cancel()
-                interrupted = True
+                # Twilio stopped playback at this instant, so the estimate is
+                # spent: the idle clock counts from here.
+                agent_speaking_until = time.monotonic()
+                # Only acknowledge a cut-off REPLY. "Sure." answering a
+                # cut-off "Are you still there?" is a non-sequitur (live call
+                # CA7d8e6e: caller said "Hello.", agent said "Sure.").
+                interrupted = last_speech_kind == "reply"
                 log_event(
                     "interrupt",
                     callSid=call_sid,
                     utteranceUntilInterrupt=message.get("utteranceUntilInterrupt"),
+                    interrupted_kind=last_speech_kind,
                 )
 
             elif msg_type == "dtmf":
