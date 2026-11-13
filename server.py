@@ -178,19 +178,41 @@ GREETING_ONLY_RE = re.compile(
 # about?" twice and the repeat guard answered "I'm having trouble hearing
 # you" both times (CA13109f). Keyed on the caller's transcribed words, not on
 # the model's output, so the decision is deterministic.
+#
+# A question is punctuated ("...?") or inverted — a question word as the FIRST
+# word. Matching a question word anywhere in the turn is not enough: the bare
+# auxiliaries below appear in ordinary statements, so "it was changed" and "I
+# was told" counted as questions and unlocked the repeat guard on a live call
+# (CAd9a6ac), letting the agent ask the same callback question three times.
 QUESTION_WORD_RE = re.compile(
-    r"\?|\b(what|why|how|who|whom|whose|when|where|which|is|are|was|were|"
+    r"\b(what|why|how|who|whom|whose|when|where|which|is|are|was|were|"
     r"do|does|did|can|could|would|should|may|might)\b",
+    re.IGNORECASE,
+)
+
+# Fillers a caller puts in front of a question ("uh, can you...", "okay so
+# what..."). Stripped before the first-word test, or the inversion is missed.
+LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:uh|um|er|ah|oh|hey|hi|hello|yeah|yep|okay|ok|so|well|and|but|"
+    r"like|just|actually|sorry)[\s,]+)+",
     re.IGNORECASE,
 )
 
 
 def _caller_asked(user_text: str) -> bool:
-    """True when the caller's turn is a real question, not a greeting/filler."""
+    """True when the caller's turn is a real question, not a greeting/filler.
+
+    Punctuated ("...?") or inverted — a question word as the first word after
+    any leading filler. A question word further into the turn is not enough:
+    "it was changed" is a statement, and counting it as a question let the
+    repeat guard through on a live call.
+    """
     t = (user_text or "").strip()
     if not t or GREETING_ONLY_RE.match(t):
         return False
-    return bool(QUESTION_WORD_RE.search(t))
+    if "?" in t:
+        return True
+    return bool(QUESTION_WORD_RE.match(LEADING_FILLER_RE.sub("", t)))
 
 
 def interrupt_acks() -> list[str]:
@@ -518,9 +540,16 @@ CALLBACK_QUESTION_FALLBACK = (
 
 # Spoken in place of a reply the model looped. Two variants, so the guard
 # never answers a loop with a loop of its own.
+#
+# Neither claims a comprehension failure. The guard fires because the MODEL
+# repeated itself, not because the caller was unintelligible, and a live call
+# (CAd9a6ac) answered two perfectly clear turns with "Sorry, I didn't catch
+# that" and "I'm having trouble hearing you" — which sounds like a broken line
+# and invites the caller to repeat themselves for nothing. These redirect
+# instead: the agent owns the repetition and asks what is actually useful.
 REPEAT_FALLBACKS = (
-    "Sorry, I didn't catch that — could you say it again?",
-    "I'm having trouble hearing you. Could you say that once more?",
+    "Let me put that another way — what would be most useful for you right now?",
+    "Sorry, let me start over. What would you like to know?",
 )
 
 
@@ -1136,23 +1165,37 @@ HANDOFF_ROUTES = (
 DEFAULT_HANDOFF_ROUTE = ("225", "our Bell EPP desk")
 
 # A pause before the extension digits. Twilio sends "w" as half a second, and
-# the store's auto-attendant answers with a greeting before it will take
-# digits: a pause that is too short gets the digits swallowed and the caller
-# lands on the main line instead of the extension. The right length is a
-# property of the store's phone system, not of this code, so it is tunable at
-# runtime — RELAY_HANDOFF_DIGIT_PAUSE is a count of half-seconds, clamped to
-# 0-20 (0-10s). Ten halves = five seconds, which clears a typical greeting.
-HANDOFF_DIGIT_PAUSE_HALVES = 10
+# the store's auto-attendant answers with a long recorded greeting before it
+# will take digits. Measured on the live line (2026-11-13): the greeting runs
+# "Thank you for calling Cellular Solution. We look forward to answering your
+# call. If you know the extension you are trying to reach, you may dial it at
+# any time during this message. Press 1 ... Press 4 for the company directory."
+# Digits sent at 5s land inside the first sentence and are DISCARDED — the
+# caller stays on the main line. Digits sent at 14.5s are accepted and the
+# call transfers. So the pause has to clear the opening sentence.
+#
+# Twilio caps sendDigits at 32 characters, so 29 halves (14.5s) is the longest
+# pause that still leaves room for a 3-digit extension. That is the default.
+# RELAY_HANDOFF_DIGIT_PAUSE overrides it in half-seconds, clamped 0-29 and
+# further capped so the whole string stays within 32 characters.
+HANDOFF_DIGIT_PAUSE_HALVES = 29
 HANDOFF_DIGIT_PAUSE = "w" * HANDOFF_DIGIT_PAUSE_HALVES
 
+# Twilio's documented limit for <Number sendDigits>.
+SEND_DIGITS_MAX = 32
 
-def handoff_digit_pause() -> str:
+
+def handoff_digit_pause(extension: str = "") -> str:
     """The DTMF lead-in pause, as Twilio "w" (half-second) characters.
 
     Read per request so the length can be tuned on Railway without a code
     change: how long the store's auto-attendant talks before it accepts
     digits is not something this repo can know. A value that is not an
     integer falls back to the default rather than dialling with no pause.
+
+    Capped so the pause plus the extension never exceeds Twilio's 32-character
+    sendDigits limit — an over-long string is rejected and the caller is left
+    on the main line, which is the failure this pause exists to prevent.
     """
     raw = os.environ.get("RELAY_HANDOFF_DIGIT_PAUSE", "").strip()
     halves = HANDOFF_DIGIT_PAUSE_HALVES
@@ -1161,7 +1204,9 @@ def handoff_digit_pause() -> str:
             halves = int(raw)
         except ValueError:
             halves = HANDOFF_DIGIT_PAUSE_HALVES
-    return "w" * max(0, min(20, halves))
+    halves = max(0, min(HANDOFF_DIGIT_PAUSE_HALVES, halves))
+    halves = min(halves, max(0, SEND_DIGITS_MAX - len(extension or "")))
+    return "w" * halves
 
 
 def handoff_route(user_text: str, is_outbound: bool = False) -> tuple[str, str] | None:
@@ -1613,7 +1658,7 @@ async def handoff_action(request: Request) -> Response:
             label = str(route.get("label") or "").strip()[:40]
     if extension:
         number = (
-            f'<Number sendDigits="{handoff_digit_pause()}{extension}">'
+            f'<Number sendDigits="{handoff_digit_pause(extension)}{extension}">'
             f"{_xml_escape(store)}</Number>"
         )
         say = f"Connecting you to {_xml_escape(label)} now." if label else (

@@ -350,24 +350,37 @@ def main():
     # swallowed by the store's auto-attendant greeting, and the caller lands on
     # the main line instead of the extension. The length is therefore tunable
     # at runtime and clamped to a sane range. ---
-    check("handoff_digit_pause() default is five seconds",
-          server.handoff_digit_pause() == "w" * 10
-          and server.HANDOFF_DIGIT_PAUSE == "w" * 10,
+    check("handoff_digit_pause() default clears the greeting (14.5s)",
+          server.handoff_digit_pause() == "w" * 29
+          and server.HANDOFF_DIGIT_PAUSE == "w" * 29,
           repr(server.handoff_digit_pause()))
     for raw, expected in (
         ("0", ""),
         ("2", "ww"),
         ("20", "w" * 20),
-        ("99", "w" * 20),      # clamped high
+        ("29", "w" * 29),
+        ("99", "w" * 29),      # clamped high
         ("-5", ""),            # clamped low
-        ("abc", "w" * 10),     # not an integer -> default
-        ("", "w" * 10),        # empty -> default
+        ("abc", "w" * 29),     # not an integer -> default
+        ("", "w" * 29),        # empty -> default
         (" 4 ", "wwww"),       # surrounding space tolerated
     ):
         os.environ["RELAY_HANDOFF_DIGIT_PAUSE"] = raw
         check(f"handoff_digit_pause() env {raw!r} -> {len(expected)} halves",
               server.handoff_digit_pause() == expected,
               repr(server.handoff_digit_pause()))
+    os.environ.pop("RELAY_HANDOFF_DIGIT_PAUSE", None)
+    # Twilio rejects a sendDigits string longer than 32 characters, and a
+    # rejected string leaves the caller on the main line — the exact failure
+    # this pause exists to prevent. The pause must shrink for a long extension.
+    for extension in ("231", "225", "123456"):
+        pause = server.handoff_digit_pause(extension)
+        check(f"handoff_digit_pause({extension!r}) keeps sendDigits <= 32",
+              len(pause) + len(extension) <= server.SEND_DIGITS_MAX,
+              f"{len(pause)} + {len(extension)}")
+    check("handoff_digit_pause('123456') shrinks to 26 halves",
+          server.handoff_digit_pause("123456") == "w" * 26,
+          repr(server.handoff_digit_pause("123456")))
     # The endpoint must use the configured pause, not the module default.
     os.environ["RELAY_HANDOFF_DIGIT_PAUSE"] = "2"
     resp, dial, say = handoff_route_of({"extension": "231", "label": "Ed"})
@@ -448,6 +461,64 @@ def main():
     check("handoff routes: every destination the store gave us is present",
           extensions == {"226", "232", "231", "220"},
           f"{sorted(extensions)}")
+
+    # --- _caller_asked(): a repeated reply is an ANSWER only when the caller
+    # actually asked something. A question word ANYWHERE in the turn is too
+    # loose — the bare auxiliaries appear in ordinary statements, so "it was
+    # changed" counted as a question and unlocked the repeat guard on a live
+    # call (CAd9a6ac), letting the agent ask the same callback question three
+    # times. A question is punctuated or inverted. ---
+    for question in (
+        "What's the call about?",
+        "what is this regarding",
+        "How much is the iPhone 17?",
+        "Can you tell me about EPP",
+        "Who are you",
+        "Is there a fee",
+        "Uh, can you transfer me to Ed?",
+        "okay so what does that include",
+        "hey, is there a fee",
+        "um, how much is it",
+    ):
+        check(f"_caller_asked({question!r}) -> question",
+              server._caller_asked(question) is True,
+              repr(server._caller_asked(question)))
+    for not_question in (
+        "Hello.",
+        "Hi there",
+        "Yes.",
+        "Okay.",
+        "Thanks.",
+        "",
+        "   ",
+        "Uh yeah, it was changed.",
+        "It was changed.",
+        "I was told it was fine.",
+        "They, they updated the uh, the platform.",
+        "Okay, I I'll send you the uh, the credentials.",
+        "Okay. Okay. All right. Bye.",
+        "We were just talking about that.",
+        "That is what I said.",
+    ):
+        check(f"_caller_asked({not_question!r}) -> not a question",
+              server._caller_asked(not_question) is False,
+              repr(server._caller_asked(not_question)))
+
+    # --- The repeat fallbacks must not claim a comprehension failure. The
+    # guard fires because the MODEL repeated itself, not because the caller
+    # was unintelligible; "Sorry, I didn't catch that" sounds like a broken
+    # line and makes the caller repeat themselves for nothing. ---
+    for fallback in server.REPEAT_FALLBACKS:
+        lowered = fallback.lower()
+        for claim in ("didn't catch", "did not catch", "trouble hearing",
+                      "can't hear", "cannot hear", "say it again",
+                      "say that again", "say that once more"):
+            check(f"repeat fallback does not claim {claim!r}",
+                  claim not in lowered, fallback)
+        check("repeat fallback is an open turn (ends in a question)",
+              "?" in fallback, fallback)
+        check("repeat fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
 
     # --- A closing ends the call: the relay sends action "close" and /handoff
     # must hang up, not dial. Dialling would put a caller who just said goodbye

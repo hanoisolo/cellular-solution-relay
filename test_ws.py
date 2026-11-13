@@ -278,6 +278,29 @@ def check_repeat_guard():
     assert len(REPEAT_FALLBACKS) == 2, REPEAT_FALLBACKS
     assert REPEAT_FALLBACKS[0] != REPEAT_FALLBACKS[1], REPEAT_FALLBACKS
 
+    # The fallbacks must not claim a comprehension failure. The guard fires
+    # because the MODEL repeated itself, not because the caller was
+    # unintelligible; a live call (CAd9a6ac) answered two clear turns with
+    # "Sorry, I didn't catch that" and "I'm having trouble hearing you", which
+    # sounds like a broken line and makes the caller repeat themselves.
+    for fallback in REPEAT_FALLBACKS:
+        lowered = fallback.lower()
+        for claim in ("didn't catch", "did not catch", "trouble hearing",
+                      "can't hear", "cannot hear", "say it again",
+                      "say that again", "say that once more"):
+            assert claim not in lowered, (
+                f"a repeat fallback claims it could not hear the caller: "
+                f"{fallback!r} contains {claim!r}"
+            )
+        # It must still be an open turn, or the dead-end guard fires on it.
+        assert "?" in fallback, (
+            f"a repeat fallback gives the caller nothing to answer: {fallback!r}"
+        )
+        assert not CLOSING_RE.search(fallback), (
+            f"a repeat fallback reads as a sign-off and would end the call: "
+            f"{fallback!r}"
+        )
+
     # The closing exemption in the reply path is load-bearing: a sign-off IS a
     # repeat, so without the CLOSING_RE branch the guard would replace
     # "Goodbye." with "Sorry, I didn't catch that" — the CA2e04 defect. The
@@ -329,6 +352,11 @@ def check_repeat_guard():
         "Can you tell me about EPP",
         "Who are you",
         "Is there a fee",
+        # A filler in front of the inversion must not hide the question.
+        "Uh, can you transfer me to Ed?",
+        "okay so what does that include",
+        "hey, is there a fee",
+        "um, how much is it",
     ):
         assert _caller_asked(question), (
             f"a real question was not recognised as one: {question!r}"
@@ -341,6 +369,18 @@ def check_repeat_guard():
         "Thanks.",
         "",
         "   ",
+        # Statements that contain a bare auxiliary verb. These are not
+        # questions, and counting them as ones unlocked the repeat guard on a
+        # live call (CAd9a6ac): the agent asked the same callback question
+        # three times because "it was changed" was read as a question.
+        "Uh yeah, it was changed.",
+        "It was changed.",
+        "I was told it was fine.",
+        "They, they updated the uh, the platform.",
+        "Okay, I I'll send you the uh, the credentials.",
+        "Okay. Okay. All right. Bye.",
+        "We were just talking about that.",
+        "That is what I said.",
     ):
         assert not _caller_asked(not_question), (
             f"a greeting/filler was read as a question: {not_question!r}"
@@ -2527,10 +2567,11 @@ async def main():
         )
         second = await _collect(ws8)
         assert second != first, f"the same reply was spoken twice: {second!r}"
-        assert second in (
-            "Sorry, I didn't catch that — could you say it again?",
-            "I'm having trouble hearing you. Could you say that once more?",
-        ), second
+        # Reference the constant, not a copy of its wording: the fallbacks are
+        # spoken text and get reworded, and a hardcoded copy silently stops
+        # testing the guard the moment they change.
+        from server import REPEAT_FALLBACKS as _REPEAT_FALLBACKS
+        assert second in _REPEAT_FALLBACKS, second
         print("PRE-SPEECH REPEAT GUARD: pass — a repeated reply is replaced")
         await ws8.close()
 
