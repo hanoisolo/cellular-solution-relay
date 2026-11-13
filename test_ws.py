@@ -149,6 +149,29 @@ def check_dead_end_guard():
     for recovery in DEAD_END_RECOVERIES:
         assert not is_dead_end(recovery), recovery
     assert DEAD_END_RECOVERIES[0] != DEAD_END_RECOVERIES[1], DEAD_END_RECOVERIES
+
+    # A reply that IS a closing is a legitimate goodbye, not a dead end. A
+    # live call (CA13109f) heard "Thanks." and answered "You're welcome.
+    # Goodbye." with "No problem. Is there anything else about EPP I can
+    # explain before we finish?" — the guard talked over the goodbye.
+    from server import _gate_commits
+
+    for goodbye in (
+        "You're welcome. Goodbye.",
+        "Goodbye.",
+        "Have a good day.",
+        "Thanks for your time. Goodbye.",
+    ):
+        assert not is_dead_end(goodbye), (
+            f"a closing was treated as a dead end: {goodbye!r}"
+        )
+        assert _gate_commits(goodbye), (
+            f"a closing was held instead of committed: {goodbye!r}"
+        )
+    # Short non-closing replies are still dead ends, and still held.
+    for still_dead in ("Okay.", "Alright.", "Sure."):
+        assert is_dead_end(still_dead), still_dead
+        assert not _gate_commits(still_dead), still_dead
     print("DEAD END GUARD CHECKS: pass")
 
 
@@ -269,6 +292,36 @@ def check_repeat_guard():
     for name, prompt in (("outbound", OUTBOUND_SYSTEM_PROMPT), ("inbound", SYSTEM_PROMPT)):
         assert "Never repeat a previous reply" in prompt, (
             f"{name} prompt lost the never-repeat-a-reply rule"
+        )
+
+    # A repeat in answer to a real question is an ANSWER, not a loop. A live
+    # call (CA13109f) asked "what's the call about?" twice, got the same
+    # designed 194-char answer twice, and the guard replaced it with "Sorry,
+    # I didn't catch that" then "I'm having trouble hearing you".
+    from server import _caller_asked
+
+    for question in (
+        "What's the call about?",
+        "what is this regarding",
+        "How much is the iPhone 17?",
+        "Can you tell me about EPP",
+        "Who are you",
+        "Is there a fee",
+    ):
+        assert _caller_asked(question), (
+            f"a real question was not recognised as one: {question!r}"
+        )
+    for not_question in (
+        "Hello.",
+        "Hi there",
+        "Yes.",
+        "Okay.",
+        "Thanks.",
+        "",
+        "   ",
+    ):
+        assert not _caller_asked(not_question), (
+            f"a greeting/filler was read as a question: {not_question!r}"
         )
     print("REPEAT GUARD CHECKS: pass")
 
@@ -525,6 +578,44 @@ def check_name_extraction():
     assert extract_name("I'm Don") == "Don"
     assert extract_name("This is Jonathan") == "Jonathan"
     print("NAME EXTRACTION CHECKS: pass")
+
+
+def check_phone_extraction():
+    """extract_phone must never keep a prefix of a longer digit run.
+
+    A live call (CA13109f) heard "90052642228" for 905-264-2228. The old
+    pattern had no trailing guard, so it matched the FIRST ten digits and
+    logged +19005264222 while the assistant read back 905-264-2228 and the
+    caller said "Yes." — a callback to a number nobody gave.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import extract_phone
+
+    # A digit run that is not a clean 10-digit number must not be truncated
+    # into one.
+    for bad in (
+        "90052642228",
+        "905-264-22288",
+        "416555010",
+        "41655501000",
+    ):
+        assert extract_phone(bad) is None, (
+            f"extract_phone kept a prefix of a longer number: {bad!r} -> "
+            f"{extract_phone(bad)!r}"
+        )
+    for good, expected in (
+        ("905-264-2228", "+19052642228"),
+        ("9052642228", "+19052642228"),
+        ("(905) 264-2228", "+19052642228"),
+        ("19052642228", "+19052642228"),
+        ("+1 905 264 2228", "+19052642228"),
+        ("my number is 416-555-0100, thanks", "+14165550100"),
+    ):
+        assert extract_phone(good) == expected, (
+            f"extract_phone missed a valid number: {good!r} -> "
+            f"{extract_phone(good)!r}"
+        )
+    print("PHONE EXTRACTION CHECKS: pass")
 
 
 def check_signature_validator():
@@ -1160,6 +1251,154 @@ async def check_pitch_turn_capture_ws():
     print("PITCH TURN CAPTURE: pass — name and number survive the pitch turn")
 
 
+async def check_post_pitch_answer_ws():
+    """End-to-end: the designed post-pitch answer must be spoken verbatim when
+    the caller asks a question, even though it is the same sentence twice.
+
+    A live call (CA13109f) asked "what's the call about?" twice. The model
+    produced the identical 194-char answer both times — because the post-pitch
+    prompt told it to ask exactly that question — and the repeat guard replaced
+    it with "Sorry, I didn't catch that" and then "I'm having trouble hearing
+    you". A repeat in answer to a real question is an answer, not a loop.
+    """
+    from server import (  # noqa: E402
+        MOCK_REPLIES,
+        OUTBOUND_PITCH,
+        REPEAT_FALLBACKS,
+    )
+
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000018"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "Hello.", "last": True})
+        )
+        assert await _spoken(ws) == OUTBOUND_PITCH, "the pitch turn did not pitch"
+
+        question = "What's the call about? aboutref"
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": question, "last": True})
+        )
+        first = await _spoken(ws)
+        assert first == MOCK_REPLIES["about"], (
+            f"the designed answer was not spoken on the first question: {first!r}"
+        )
+        # Same question again: the model answers with the same sentence. That
+        # is the answer the caller asked for, so it must be spoken again.
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": question, "last": True})
+        )
+        second = await _spoken(ws)
+        assert second == MOCK_REPLIES["about"], (
+            f"the repeat guard ate the answer to a real question: {second!r}"
+        )
+        assert second not in REPEAT_FALLBACKS, second
+
+        # A greeting is not a question, so a repeated reply to one is still a
+        # loop and must still be replaced.
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "Hello.", "last": True})
+        )
+        await _spoken(ws)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "Hello.", "last": True})
+        )
+        guarded = await _spoken(ws)
+        assert guarded in REPEAT_FALLBACKS, (
+            f"a repeated reply to a greeting was not guarded: {guarded!r}"
+        )
+    print("POST-PITCH ANSWER: pass — a question's answer is not a repeat")
+
+
+async def check_phone_ambiguous_ws():
+    """End-to-end: a digit run that is not a clean 10-digit number must never
+    be stored as a callback number.
+
+    A live call (CA13109f) heard "90052642228" for 905-264-2228. The old
+    pattern kept the first ten digits, so CALLBACK_REQUEST logged
+    +19005264222 while the assistant read back 905-264-2228 and the caller
+    said "Yes." The handoff payload is the observable end of that pipeline.
+    """
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    async def _handoff_callback(call_sid, utterance):
+        setup = dict(SETUP)
+        setup["callSid"] = call_sid
+        setup["direction"] = "inbound"
+        async with websockets.connect(WS_URL, max_size=2**20) as ws:
+            await ws.send(json.dumps(setup))
+            await asyncio.sleep(0.5)
+            await ws.send(
+                json.dumps(
+                    {"type": "prompt", "voicePrompt": utterance, "last": True}
+                )
+            )
+            await _spoken(ws)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "prompt",
+                        "voicePrompt": "Can I speak to a representative?",
+                        "last": True,
+                    }
+                )
+            )
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                m = json.loads(raw)
+                if m.get("type") == "end":
+                    hd = json.loads(m.get("handoffData") or "{}")
+                    return hd.get("callback") or {}
+        raise AssertionError("no end message after the handoff request")
+
+    # 11 digits that do not start with 1: ambiguous, so nothing is stored.
+    cb = await _handoff_callback(
+        "CAtest0000000000000000000000000019",
+        "My name is Don and my number is 90052642228",
+    )
+    assert not cb.get("phone"), (
+        f"an ambiguous digit run was stored as a callback number: {cb}"
+    )
+
+    # The same caller saying the ten digits clearly is captured.
+    cb = await _handoff_callback(
+        "CAtest0000000000000000000000000020",
+        "My name is Don and my number is 905-264-2228",
+    )
+    assert cb.get("phone") == "+19052642228", (
+        f"a clear 10-digit number was not captured: {cb}"
+    )
+    print("PHONE AMBIGUITY: pass — no number stored from an unclear digit run")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -1595,6 +1834,7 @@ async def main():
 
     check_signature_validator()
     check_name_extraction()
+    check_phone_extraction()
     check_truncation()
     check_recording_gate()
     check_dead_end_guard()
@@ -1610,6 +1850,8 @@ async def main():
     await check_forbidden_question_ws()
     await check_forbidden_question_late_ws()
     await check_pitch_turn_capture_ws()
+    await check_post_pitch_answer_ws()
+    await check_phone_ambiguous_ws()
     print("\nALL TESTS PASSED")
 
 

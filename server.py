@@ -173,6 +173,25 @@ GREETING_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A caller turn that asks something. A repeated assistant reply is then an
+# ANSWER to that question, not a loop: a live call asked "what's the call
+# about?" twice and the repeat guard answered "I'm having trouble hearing
+# you" both times (CA13109f). Keyed on the caller's transcribed words, not on
+# the model's output, so the decision is deterministic.
+QUESTION_WORD_RE = re.compile(
+    r"\?|\b(what|why|how|who|whom|whose|when|where|which|is|are|was|were|"
+    r"do|does|did|can|could|would|should|may|might)\b",
+    re.IGNORECASE,
+)
+
+
+def _caller_asked(user_text: str) -> bool:
+    """True when the caller's turn is a real question, not a greeting/filler."""
+    t = (user_text or "").strip()
+    if not t or GREETING_ONLY_RE.match(t):
+        return False
+    return bool(QUESTION_WORD_RE.search(t))
+
 
 def interrupt_acks() -> list[str]:
     """Acknowledgements to rotate through. An explicitly empty
@@ -226,10 +245,15 @@ def should_disclose_recording(user_text: str, caller_turns: int) -> bool:
 
 def is_dead_end(reply: str) -> bool:
     """True when a reply gives the caller nothing to respond to: a few words
-    with no question in them."""
+    with no question in them. A reply that is itself a closing ("You're
+    welcome. Goodbye.") is a legitimate close, not a dead end — a live call
+    said "Thanks." and the guard answered with another question (CA13109f).
+    """
     t = (reply or "").strip()
     if not t:
         return True
+    if CLOSING_RE.search(t):
+        return False
     if "?" in t:
         return False
     return len(t.split()) <= DEAD_END_MAX_WORDS
@@ -295,6 +319,10 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
     # reply instead of committing on its question mark.
     if FORBIDDEN_QUESTION_RE.search(t):
         return False
+    # A closing commits at once: holding it to end-of-stream only delays a
+    # goodbye, and is_dead_end no longer treats it as a dead end.
+    if CLOSING_RE.search(t):
+        return True
     return "?" in t or len(t.split()) > DEAD_END_MAX_WORDS
 
 
@@ -481,13 +509,11 @@ OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH = (
     + "You have ALREADY given the EPP pitch on this call. Never give it "
     "again, not even reworded, and never repeat the website directions. "
     "If the caller says 'hello', is unclear, or asks what the call is "
-    "about, answer in ONE short sentence — for example 'I'm calling about "
-    "Bell's Employee Purchase Program, which saves eligible employees 30 "
-    "percent on mobility plans' — then ask exactly this question: 'Would "
-    "you like the store to call you back about Bell's Employee Purchase "
-    "Program?' Never ask which company they work for or whether their "
-    "company offers EPP: they cannot know that, and only the store can "
-    "confirm eligibility. "
+    "about, answer in ONE short sentence in your own words about what the "
+    "call is about, then ask this question: 'Would you like the store to "
+    "call you back about Bell's Employee Purchase Program?' Never ask which "
+    "company they work for or whether their company offers EPP: they "
+    "cannot know that, and only the store can confirm eligibility. "
     "Your next step is the callback offer: ask for their name and the best "
     "number to reach them at, one question at a time. "
     + _OUTBOUND_EPP_FACTS
@@ -649,6 +675,14 @@ MOCK_REPLIES = {
     "badq_late": (
         "Sure, I can help with that. Are you with a company that offers EPP?"
     ),
+    # The designed post-pitch answer to "what's the call about?". Deliberately
+    # free of the pitch's own claims ("30 percent", "activation fee") so
+    # _pitch_delivered does not read it as a re-pitch. Only reachable in
+    # MOCK_LLM mode.
+    "about": (
+        "This call is about Bell's Employee Purchase Program for your company. "
+        "Would you like the store to call you back about it?"
+    ),
     # Report which outbound prompt phase the model is being given.
     "pitch_seen": "Yes, the post-pitch prompt is in place.",
     "pitch_missing": "No, the pre-pitch prompt is still in place.",
@@ -671,6 +705,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["pitch_seen"] if swapped else MOCK_REPLIES["pitch_missing"]
     if "pitchme" in lowered:
         return MOCK_REPLIES["pitch"]
+    if "aboutref" in lowered:
+        return MOCK_REPLIES["about"]
     if "badqlate" in lowered:
         return MOCK_REPLIES["badq_late"]
     if "badq" in lowered:
@@ -712,6 +748,7 @@ def new_call_state() -> dict:
         "callback_phone": None,
         "callback_logged": False,
         "phone_buffer": "",
+        "phone_ambiguous": False,
         "expecting_name": False,
         "callback_offered": False,
         "recording_disclosed": False,
@@ -818,7 +855,7 @@ def _twilio_auth_token() -> str:
 # Callback capture (best effort, V1).
 # ---------------------------------------------------------------------------
 PHONE_RE = re.compile(
-    r"(?:\+?1[\s.\-]?)?(?:\(?(\d{3})\)?[\s.\-]?)(\d{3})[\s.\-]?(\d{4})"
+    r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(?(\d{3})\)?[\s.\-]?)(\d{3})[\s.\-]?(\d{4})(?!\d)"
 )
 # Words that look like a name to a naive regex but never are one. STT
 # transcripts are often all-lowercase, so the name patterns below match
@@ -1484,7 +1521,12 @@ async def relay_ws(websocket: WebSocket) -> None:
         )
 
     async def send_text_tokens(
-        reply_stream, spoken_box=None, prev_assistant="", recent_replies=(), closing=False
+        reply_stream,
+        spoken_box=None,
+        prev_assistant="",
+        recent_replies=(),
+        closing=False,
+        user_text="",
     ) -> tuple[str, float]:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -1637,10 +1679,20 @@ async def relay_ws(websocket: WebSocket) -> None:
                 )
                 replacement = CALLBACK_QUESTION_FALLBACK
             elif repeated is not None:
-                log_event("repeat_guard", callSid=call_sid, text=gate.strip())
-                replacement = REPEAT_FALLBACKS[0]
-                if _norm_text(repeated) == _norm_text(replacement):
-                    replacement = REPEAT_FALLBACKS[1]
+                # A repeat in answer to a clear question is an ANSWER, not a
+                # loop: the post-pitch prompt tells the model what to say when
+                # the caller asks what the call is about, so the same sentence
+                # twice is expected. A pitch-like repeat is still replaced —
+                # that is the loop this guard was built for.
+                if _caller_asked(user_text) and not _pitch_delivered(gate):
+                    log_event(
+                        "repeat_allowed_answer", callSid=call_sid, text=gate.strip()
+                    )
+                else:
+                    log_event("repeat_guard", callSid=call_sid, text=gate.strip())
+                    replacement = REPEAT_FALLBACKS[0]
+                    if _norm_text(repeated) == _norm_text(replacement):
+                        replacement = REPEAT_FALLBACKS[1]
             elif not closing and is_dead_end(gate):
                 log_event("dead_end_guard", callSid=call_sid, text=gate.strip())
                 replacement = DEAD_END_RECOVERIES[0]
@@ -1877,17 +1929,29 @@ async def relay_ws(websocket: WebSocket) -> None:
                 else:
                     # Bank digit groups of 3+ across turns ("289." ...
                     # "901." ... "0990."). Groups under 3 digits ("3 pm",
-                    # "30 percent") are ignored, and the last 10 banked
-                    # digits win, so a stray number mentioned earlier
-                    # ("I pay 129") can't corrupt the real number.
+                    # "30 percent") are ignored.
                     for group in re.findall(r"\d+", user_text):
                         if len(group) >= 3:
                             state["phone_buffer"] += group
-                    if len(state["phone_buffer"]) >= 10:
+                    buf = state["phone_buffer"]
+                    if len(buf) == 10:
                         if not state["callback_phone"]:
                             phone_newly_captured = True
-                        state["callback_phone"] = "+1" + state["phone_buffer"][-10:]
+                        state["callback_phone"] = "+1" + buf
                         state["phone_buffer"] = ""
+                    elif len(buf) == 11 and buf.startswith("1"):
+                        if not state["callback_phone"]:
+                            phone_newly_captured = True
+                        state["callback_phone"] = "+1" + buf[1:]
+                        state["phone_buffer"] = ""
+                    elif len(buf) > 10:
+                        # Ambiguous, e.g. 11 digits not starting with 1 (a live
+                        # call heard "90052642228" for 905-264-2228). Never
+                        # store a number the caller did not confirm: drop the
+                        # buffer and have the model ask for the ten digits
+                        # again.
+                        state["phone_buffer"] = ""
+                        state["phone_ambiguous"] = True
                 name = extract_name(user_text)
                 if name:
                     state["callback_name"] = name
@@ -1936,6 +2000,24 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 "10-digit phone number. Confirm the full "
                                 "number in your reply and do not ask for "
                                 "more digits."
+                            ),
+                        },
+                    )
+                elif state.get("phone_ambiguous"):
+                    # The digits did not form a clean 10-digit number (a live
+                    # call heard "90052642228" for 905-264-2228 and the old
+                    # regex silently kept the first ten). Nothing was stored,
+                    # so the model must not read back a number it invented.
+                    state["phone_ambiguous"] = False
+                    history.insert(
+                        len(history) - 1,
+                        {
+                            "role": "system",
+                            "content": (
+                                "The caller's digits did not form a clear "
+                                "10-digit phone number. Do NOT confirm or "
+                                "repeat any number. Ask the caller to say the "
+                                "ten digits again, slowly."
                             ),
                         },
                     )
@@ -2024,6 +2106,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             prev_assistant=prev_assistant,
                             recent_replies=state["recent_replies"],
                             closing=closing,
+                            user_text=user_text,
                         )
                     )
                     reply = ""
@@ -2156,7 +2239,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # made it re-pitch after a "hello". Removing the trigger
                         # is the fix; another negative rule is not.
                         _swap_to_after_pitch(history, state, call_sid)
-                    if is_repeat(prev_assistant, reply.strip()):
+                    if is_repeat(prev_assistant, reply.strip()) and not (
+                        _caller_asked(user_text) and not _pitch_delivered(reply)
+                    ):
                         # History-level backstop only: the caller has already
                         # heard this reply, so this keeps the model from
                         # seeing its own loop on the next turn. What the
