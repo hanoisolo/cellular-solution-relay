@@ -819,6 +819,59 @@ async def main():
         print("DEAD END GUARD: pass — 'Okay.' replaced with a next step")
         await ws6.close()
 
+    # An interrupt must leave a one-shot note telling the model not to repeat
+    # itself. The interrupt truncates the assistant turn to what the caller
+    # heard, so it no longer reads as "I already gave the pitch" and a live
+    # call re-emitted the same 372-char pitch verbatim on "Hello.".
+    setup7 = dict(SETUP)
+    setup7["callSid"] = "CAtest0000000000000000000000000006"
+    setup7["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws7:
+        await ws7.send(json.dumps(setup7))
+        await asyncio.sleep(0.5)
+        await ws7.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "Tell me about EPP.", "last": True}
+            )
+        )
+        await asyncio.sleep(0.2)
+        await ws7.send(
+            json.dumps(
+                {"type": "interrupt", "utteranceUntilInterrupt": "I'm the automated"}
+            )
+        )
+        # Drain whatever the interrupted turn had already queued.
+        try:
+            while True:
+                await asyncio.wait_for(ws7.recv(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        await ws7.send(
+            json.dumps({"type": "prompt", "voicePrompt": "noteref", "last": True})
+        )
+        acks = {"Sure.", "Go ahead.", "Of course."}
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws7.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text":
+                continue
+            if m.get("interruptible") is False:
+                continue  # the outbound greeting and the recording notice
+            tok = m.get("token") or ""
+            if tok.strip() in acks:
+                continue  # the interrupt acknowledgement
+            tokens.append(tok)
+            if m.get("last") is True:
+                break
+        reply = "".join(tokens).strip()
+        assert "see the interrupt note" in reply, (
+            f"interrupt note did not reach the model: {reply!r}"
+        )
+        print("INTERRUPT NOTE: pass — model told not to repeat after a cut-in")
+        await ws7.close()
+
     check_signature_validator()
     check_name_extraction()
     check_truncation()

@@ -454,6 +454,9 @@ MOCK_REPLIES = {
     # Deliberately a dead end, so the dead-end guard can be exercised
     # end-to-end. Only reachable in MOCK_LLM mode.
     "deadend": "Okay.",
+    # Report whether the one-shot interrupt note reached the model.
+    "note_seen": "Yes, I can see the interrupt note in the history.",
+    "note_missing": "No interrupt note was found in the history.",
 }
 
 
@@ -464,6 +467,13 @@ def _mock_reply_for(history: list[dict]) -> str:
         "",
     )
     lowered = last_user.lower()
+    if "noteref" in lowered:
+        seen = any(
+            m.get("role") == "system"
+            and "interrupted you mid-sentence" in (m.get("content") or "")
+            for m in history
+        )
+        return MOCK_REPLIES["note_seen"] if seen else MOCK_REPLIES["note_missing"]
     if "deadend" in lowered:
         return MOCK_REPLIES["deadend"]
     if "callback" in lowered or "call me back" in lowered:
@@ -498,6 +508,7 @@ def new_call_state() -> dict:
         "callback_offered": False,
         "recording_disclosed": False,
         "caller_turns": 0,
+        "interrupted": False,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -1656,6 +1667,27 @@ async def relay_ws(websocket: WebSocket) -> None:
                         },
                     )
 
+                # The caller cut the assistant off last turn. The truncated
+                # assistant turn no longer reads as "I already said this", so
+                # the model re-emits the whole pitch — a live call repeated
+                # the same 372-char pitch verbatim on "Hello.". One-shot note,
+                # inserted before the just-appended user message for the same
+                # reason as the phone-number note above.
+                if state.pop("interrupted", False):
+                    history.insert(
+                        len(history) - 1,
+                        {
+                            "role": "system",
+                            "content": (
+                                "The caller interrupted you mid-sentence. Do "
+                                "not repeat anything you already said, and do "
+                                "not give the EPP pitch again. Respond only to "
+                                "what the caller just said; if it was unclear, "
+                                "ask one short clarifying question."
+                            ),
+                        },
+                    )
+
                 # Everything the caller has dictated this turn is now in
                 # `state`; persist it before the LLM call so a WebSocket drop
                 # mid-reply cannot lose a name or number.
@@ -1718,6 +1750,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                                 # Acknowledge on the prompt that follows, not
                                 # now: the caller is still mid-sentence.
                                 interrupted = True
+                                # The truncated assistant turn no longer looks
+                                # like "I already gave the pitch", so the model
+                                # re-emits it. A live call repeated the same
+                                # 372-char pitch verbatim on "Hello.".
+                                state["interrupted"] = True
                                 reply = ""
                                 break
                             elif live.get("type") == "dtmf":
