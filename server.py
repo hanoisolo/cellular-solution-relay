@@ -283,6 +283,10 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
         p = _norm_text(prev)
         if p and c and (p.startswith(c) or c.startswith(p)):
             return False
+    # A question the caller cannot answer must never be spoken, so hold the
+    # reply instead of committing on its question mark.
+    if FORBIDDEN_QUESTION_RE.search(t):
+        return False
     return "?" in t or len(t.split()) > DEAD_END_MAX_WORDS
 
 
@@ -304,6 +308,26 @@ REPEAT_MIN_BLOCK = 150
 # enough: a live call re-spoke the pitch two turns after the first one, with a
 # short "Sorry, I didn't catch that" fallback in between.
 RECENT_REPLIES_KEPT = 3
+
+# Questions the caller cannot answer. The agent does not have the list of
+# partner companies, so "are you with a company that offers EPP?" asks the
+# caller to know something only the store knows. A live call asked exactly
+# that (CA7d8e6e) even though the prompt forbids it, which is why this is a
+# deterministic guard and not another prompt rule.
+FORBIDDEN_QUESTION_RE = re.compile(
+    r"\b(are you with|is your (company|employer)|does your (company|employer)"
+    r"|do you work for|what (company|employer) do you"
+    r"|are you (a|an) bell employee|is your company (eligible|on the list)"
+    r"|does your company offer)\b",
+    re.IGNORECASE,
+)
+
+# Spoken instead of a forbidden question: the next step the call actually
+# wants, which the caller can always answer.
+CALLBACK_QUESTION_FALLBACK = (
+    "Would you like the store to call you back about Bell's Employee "
+    "Purchase Program?"
+)
 
 # Spoken in place of a reply the model looped. Two variants, so the guard
 # never answers a loop with a loop of its own.
@@ -422,8 +446,11 @@ OUTBOUND_SYSTEM_PROMPT_AFTER_PITCH = (
     "If the caller says 'hello', is unclear, or asks what the call is "
     "about, answer in ONE short sentence — for example 'I'm calling about "
     "Bell's Employee Purchase Program, which saves eligible employees 30 "
-    "percent on mobility plans' — then ask one specific question, such as "
-    "whether they would like the store to call them back. "
+    "percent on mobility plans' — then ask exactly this question: 'Would "
+    "you like the store to call you back about Bell's Employee Purchase "
+    "Program?' Never ask which company they work for or whether their "
+    "company offers EPP: they cannot know that, and only the store can "
+    "confirm eligibility. "
     "Your next step is the callback offer: ask for their name and the best "
     "number to reach them at, one question at a time. "
     + _OUTBOUND_EPP_FACTS
@@ -577,6 +604,9 @@ MOCK_REPLIES = {
         "solution dot c a, click Employee Offers, and type in your company "
         "name. Would you like the store to call you back?"
     ),
+    # A question the caller cannot answer, so the guard can be exercised
+    # end-to-end. Only reachable in MOCK_LLM mode.
+    "badq": "Are you with a company that offers EPP?",
     # Report which outbound prompt phase the model is being given.
     "pitch_seen": "Yes, the post-pitch prompt is in place.",
     "pitch_missing": "No, the pre-pitch prompt is still in place.",
@@ -599,6 +629,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["pitch_seen"] if swapped else MOCK_REPLIES["pitch_missing"]
     if "pitchme" in lowered:
         return MOCK_REPLIES["pitch"]
+    if "badq" in lowered:
+        return MOCK_REPLIES["badq"]
     if "noteref" in lowered:
         seen = any(
             m.get("role") == "system"
@@ -1511,7 +1543,12 @@ async def relay_ws(websocket: WebSocket) -> None:
             repeated = next(
                 (r for r in recent_replies if is_repeat(r, gate)), None
             )
-            if repeated is not None:
+            if FORBIDDEN_QUESTION_RE.search(gate):
+                log_event(
+                    "forbidden_question_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = CALLBACK_QUESTION_FALLBACK
+            elif repeated is not None:
                 log_event("repeat_guard", callSid=call_sid, text=gate.strip())
                 replacement = REPEAT_FALLBACKS[0]
                 if _norm_text(repeated) == _norm_text(replacement):

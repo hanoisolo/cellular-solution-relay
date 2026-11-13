@@ -404,6 +404,57 @@ def check_speech_timing():
     print("SPEECH TIMING CHECKS: pass — the idle clock follows playback, not send")
 
 
+def check_forbidden_question():
+    """The agent must never ask something the caller cannot answer.
+
+    Live call CA7d8e6e asked "Are you with a company that offers EPP?" — the
+    caller has no idea which companies offer EPP, and the prompt already
+    forbids it. Prompt text is probabilistic, so this is a deterministic gate:
+    the reply is held and replaced before anything is spoken.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import (
+        CALLBACK_QUESTION_FALLBACK,
+        FORBIDDEN_QUESTION_RE,
+        _gate_commits,
+    )
+
+    for text in (
+        "Are you with a company that offers EPP?",
+        "Is your company eligible for EPP?",
+        "Does your company offer EPP?",
+        "Do you work for Bell?",
+        "Are you a Bell employee?",
+        "What company do you work for?",
+    ):
+        assert FORBIDDEN_QUESTION_RE.search(text), (
+            f"unanswerable question not caught: {text!r}"
+        )
+        assert not _gate_commits(text), (
+            f"unanswerable question would be spoken: {text!r}"
+        )
+
+    # Legitimate replies must still commit, or every turn pays the hold.
+    for text in (
+        "Would you like the store to call you back about Bell's Employee "
+        "Purchase Program?",
+        "The store is open Monday to Friday, 9am to 5pm. Would you like a callback?",
+        "The iPhone 17 256GB is 62 dollars 91 a month with tax. Would you like "
+        "the store to confirm the other sizes?",
+    ):
+        assert not FORBIDDEN_QUESTION_RE.search(text), (
+            f"legitimate reply flagged as unanswerable: {text!r}"
+        )
+        assert _gate_commits(text), f"legitimate reply would be held: {text!r}"
+
+    # The replacement must itself be answerable and must not trip the guard.
+    assert "?" in CALLBACK_QUESTION_FALLBACK, CALLBACK_QUESTION_FALLBACK
+    assert not FORBIDDEN_QUESTION_RE.search(CALLBACK_QUESTION_FALLBACK), (
+        "the fallback question trips its own guard"
+    )
+    print("FORBIDDEN QUESTION CHECKS: pass — unanswerable questions are held")
+
+
 def check_name_extraction():
     """extract_name must not read an "I'm <state>" reply as a name. A live
     call captured "Listening" from "I'm listening." and logged a
@@ -857,6 +908,39 @@ async def check_ack_suppression():
     print("ACK SUPPRESSION: pass — no 'Sure.' after 'Hello.', ack kept for real turns")
 
 
+async def check_forbidden_question_ws():
+    """End-to-end: a forbidden question from the model must never be spoken."""
+    from server import CALLBACK_QUESTION_FALLBACK  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000015"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "badq", "last": True})
+        )
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        spoken = "".join(tokens).strip()
+        assert "are you with a company" not in spoken.lower(), (
+            f"the unanswerable question was spoken: {spoken!r}"
+        )
+        assert spoken == CALLBACK_QUESTION_FALLBACK, (
+            f"expected the callback question instead, got: {spoken!r}"
+        )
+    print("FORBIDDEN QUESTION WS: pass — replaced before it was spoken")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -1293,11 +1377,13 @@ async def main():
     check_repeat_guard()
     check_pitch_phase()
     check_speech_timing()
+    check_forbidden_question()
     check_epp_offers_ws()
     await check_idle_prompt()
     await check_reconnect_state()
     await check_pitch_phase_ws()
     await check_ack_suppression()
+    await check_forbidden_question_ws()
     print("\nALL TESTS PASSED")
 
 
