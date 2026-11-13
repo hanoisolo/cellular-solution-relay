@@ -85,16 +85,71 @@ def check_truncation():
     print("TRUNCATION CHECKS: pass")
 
 
-def check_affirmative():
-    """is_affirmative gates the outbound recording notice."""
+def check_recording_gate():
+    """should_disclose_recording gates the outbound recording notice. A live
+    call opened with "Hello.", which the old affirmative-only gate rejected,
+    so no notice played for 77 seconds and then it landed on "Uh, okay.
+    That's it." on the way out."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from server import is_affirmative
+    from server import should_disclose_recording
 
-    for yes in ("Yes.", "yeah, go ahead", "sure, I have a minute", "ok", "of course"):
-        assert is_affirmative(yes), yes
-    for no in ("No, I'm busy", "not now", "", "what is this about?", "nope"):
-        assert not is_affirmative(no), no
-    print("AFFIRMATIVE CHECKS: pass")
+    # First caller turn: disclose unless the caller clearly declined.
+    for text in (
+        "Hello.",
+        "Yes.",
+        "yeah, go ahead",
+        "sure, I have a minute",
+        "Who is this?",
+        "What?",
+        "Uh, okay.",
+    ):
+        assert should_disclose_recording(text, 1), text
+    for text in ("No, I'm busy", "not now", "nope", ""):
+        assert not should_disclose_recording(text, 1), text
+
+    # Second caller turn: disclose regardless, so a call that keeps going can
+    # never run without the notice.
+    for text in ("No, I'm busy", "not now", ""):
+        assert should_disclose_recording(text, 2), text
+    print("RECORDING GATE CHECKS: pass")
+
+
+def check_dead_end_guard():
+    """is_dead_end catches the single-word replies a live call produced
+    ("Okay." / "Alright.") after the caller declined the callback."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from server import is_dead_end, CLOSING_RE, DEAD_END_RECOVERIES
+
+    for dead in ("Okay.", "Alright.", "Sure.", "Got it.", "", "Thanks."):
+        assert is_dead_end(dead), dead
+    for alive in (
+        "Would you like the store to call you back?",
+        "No problem. Is there anything else about EPP I can explain before we finish?",
+        "The store is open Monday to Friday, 9am to 5pm.",
+        "EPP gives employees of select partner companies up to 30 percent off "
+        "Bell mobility plans and no activation fees.",
+    ):
+        assert not is_dead_end(alive), alive
+
+    # A caller wrapping up must not be answered with another question.
+    for closing in (
+        "Uh, okay. That's it.",
+        "That's all, thanks.",
+        "Goodbye.",
+        "Nothing else.",
+        "I'm done.",
+        "No thanks.",
+    ):
+        assert CLOSING_RE.search(closing), closing
+    for not_closing in ("No.", "Hello.", "Tell me more.", "What are the fees?"):
+        assert not CLOSING_RE.search(not_closing), not_closing
+
+    # The recovery must not itself be a dead end, and the two variants must
+    # differ so the guard cannot repeat itself.
+    for recovery in DEAD_END_RECOVERIES:
+        assert not is_dead_end(recovery), recovery
+    assert DEAD_END_RECOVERIES[0] != DEAD_END_RECOVERIES[1], DEAD_END_RECOVERIES
+    print("DEAD END GUARD CHECKS: pass")
 
 
 def check_repeat_guard():
@@ -698,10 +753,77 @@ async def main():
         print("NEGATIVE ANSWER: pass — no recording notice")
         await ws4.close()
 
+    # Outbound + a bare greeting: the notice must still fire on the first
+    # caller turn. A live call opened with "Hello.", the old affirmative-only
+    # gate rejected it, and the notice did not play for 77 seconds.
+    setup5 = dict(SETUP)
+    setup5["callSid"] = "CAtest0000000000000000000000000004"
+    setup5["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws5:
+        await ws5.send(json.dumps(setup5))
+        await asyncio.sleep(0.5)
+        await ws5.send(
+            json.dumps({"type": "prompt", "voicePrompt": "Hello.", "last": True})
+        )
+        seen = []
+        notices = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws5.recv(), timeout=10)
+            m = json.loads(raw)
+            seen.append(m)
+            if m.get("type") != "text":
+                continue
+            if m.get("interruptible") is False:
+                # The outbound greeting and the recording notice are both
+                # non-interruptible last=true tokens.
+                if "recorded" in (m.get("token") or "").lower():
+                    notices.append(m)
+                continue
+            if m.get("last") is True:
+                break
+        assert notices, "no recording notice after a bare greeting"
+        assert notices[0].get("interruptible") is False, (
+            f"recording notice must be non-interruptible: {notices[0]}"
+        )
+        print("GREETING DISCLOSURE: pass — notice fires on 'Hello.'")
+        await ws5.close()
+
+    # A dead-end reply from the model ("Okay.") must be replaced with a next
+    # step, not spoken as-is. A live call said "Okay." and "Alright." twice in
+    # a row after the caller declined the callback.
+    setup6 = dict(SETUP)
+    setup6["callSid"] = "CAtest0000000000000000000000000005"
+    setup6["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws6:
+        await ws6.send(json.dumps(setup6))
+        await asyncio.sleep(0.5)
+        await ws6.send(
+            json.dumps({"type": "prompt", "voicePrompt": "deadend", "last": True})
+        )
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws6.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text":
+                continue
+            if m.get("interruptible") is False:
+                continue  # the outbound greeting and the recording notice
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        reply = "".join(tokens).strip()
+        assert reply != "Okay.", "dead-end reply spoken as-is"
+        assert "?" in reply, f"dead-end recovery has no question: {reply!r}"
+        print("DEAD END GUARD: pass — 'Okay.' replaced with a next step")
+        await ws6.close()
+
     check_signature_validator()
     check_name_extraction()
     check_truncation()
-    check_affirmative()
+    check_recording_gate()
+    check_dead_end_guard()
     check_repeat_guard()
     check_epp_offers_ws()
     await check_idle_prompt()

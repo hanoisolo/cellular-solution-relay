@@ -144,23 +144,68 @@ def interrupt_acks() -> list[str]:
     raw = os.environ.get("RELAY_INTERRUPT_ACK", INTERRUPT_ACKS)
     return [a.strip() for a in raw.split("|") if a.strip()]
 
-AFFIRMATIVE_RE = re.compile(
-    r"\b(yes|yeah|yep|sure|okay|ok|go ahead|absolutely|of course|"
-    r"i have a minute|one minute|just a minute|a minute|i do)\b",
-    re.IGNORECASE,
-)
 NEGATIVE_RE = re.compile(
     r"\b(no|nope|not|busy|don't|dont|can't|cant|hang on|later|stop)\b",
     re.IGNORECASE,
 )
 
 
-def is_affirmative(text: str) -> bool:
-    """True when a caller turn reads as a positive answer ("yes, go ahead")."""
-    t = (text or "").strip().lower()
-    if not t or NEGATIVE_RE.search(t):
+# The caller is wrapping up. A short goodbye from the assistant is the right
+# reply here, so the dead-end guard must stay out of the way.
+CLOSING_RE = re.compile(
+    r"\b(that'?s it|that is it|that'?s all|nothing else|goodbye|good bye|bye|"
+    r"hang up|i'?m done|we'?re done|no thanks)\b",
+    re.IGNORECASE,
+)
+
+# A reply this short with no question leaves the caller with nothing to say.
+# The prompt forbids it ("Never answer with a single word like 'Great' or
+# 'Okay'") but a live call produced "Okay." and "Alright." twice in a row
+# after the caller declined the callback, so the prompt alone is not enough.
+DEAD_END_MAX_WORDS = 3
+DEAD_END_RECOVERIES = (
+    "No problem. Is there anything else about EPP I can explain before we finish?",
+    "That's fine. Is there anything else you would like to know about EPP?",
+)
+
+
+def should_disclose_recording(user_text: str, caller_turns: int) -> bool:
+    """True when the outbound recording notice should be spoken on this turn.
+
+    The notice used to wait for an affirmative answer to "do you have a quick
+    minute?". A live call showed the cost: the caller opened with "Hello.",
+    which is not affirmative, so no notice played for 77 seconds and then it
+    landed on "Uh, okay. That's it." on the way out. A greeting is not
+    consent, but it is not a refusal either, so disclose on the first turn
+    that is not a clear decline — and on the second turn regardless, so a
+    call that keeps going can never run without the notice.
+    """
+    if caller_turns >= 2:
+        return True
+    t = (user_text or "").strip().lower()
+    if not t:
         return False
-    return bool(AFFIRMATIVE_RE.search(t))
+    return not NEGATIVE_RE.search(t)
+
+
+def is_dead_end(reply: str) -> bool:
+    """True when a reply gives the caller nothing to respond to: a few words
+    with no question in them."""
+    t = (reply or "").strip()
+    if not t:
+        return True
+    if "?" in t:
+        return False
+    return len(t.split()) <= DEAD_END_MAX_WORDS
+
+
+def _gate_commits(partial: str) -> bool:
+    """True once a reply being generated is past the point where it could be
+    a dead end: it asks a question, or it runs longer than a dead end."""
+    t = (partial or "").strip()
+    if not t:
+        return False
+    return "?" in t or len(t.split()) > DEAD_END_MAX_WORDS
 
 
 def _norm_text(s: str) -> str:
@@ -406,6 +451,9 @@ MOCK_REPLIES = {
         "percent off Bell mobility plans with no activation fees. What can I "
         "help you with today?"
     ),
+    # Deliberately a dead end, so the dead-end guard can be exercised
+    # end-to-end. Only reachable in MOCK_LLM mode.
+    "deadend": "Okay.",
 }
 
 
@@ -416,6 +464,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         "",
     )
     lowered = last_user.lower()
+    if "deadend" in lowered:
+        return MOCK_REPLIES["deadend"]
     if "callback" in lowered or "call me back" in lowered:
         return MOCK_REPLIES["callback"]
     if "price" in lowered or "cost" in lowered or "much" in lowered:
@@ -447,6 +497,7 @@ def new_call_state() -> dict:
         "expecting_name": False,
         "callback_offered": False,
         "recording_disclosed": False,
+        "caller_turns": 0,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -1148,7 +1199,9 @@ async def relay_ws(websocket: WebSocket) -> None:
             {"type": "end", "handoffData": json.dumps(payload)}
         )
 
-    async def send_text_tokens(reply_stream, spoken_box=None) -> str:
+    async def send_text_tokens(
+        reply_stream, spoken_box=None, prev_assistant="", closing=False
+    ) -> str:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
         (raw, for history/logs).
@@ -1177,6 +1230,12 @@ async def relay_ws(websocket: WebSocket) -> None:
         full = ""
         pending = ""
         prev_ended_with_site = False
+        # Pre-speech gate: a reply is held until it is past the point where it
+        # could be a dead end, so "Okay." can be replaced BEFORE the caller
+        # hears it. Rewriting `reply` after the stream had already been sent
+        # only changed the log, not what was said.
+        gate = ""
+        committed = False
 
         def _split_pending(text: str) -> tuple[str, str]:
             """Split text into (safe to emit, hold back)."""
@@ -1261,13 +1320,32 @@ async def relay_ws(websocket: WebSocket) -> None:
                             "first_token", callSid=call_sid, ms=round(first_token_ms, 1)
                         )
                     full += token
-                    pending += token
+                    if committed:
+                        pending += token
+                    else:
+                        gate += token
+                        if _gate_commits(gate):
+                            committed = True
+                            pending += gate
+                            gate = ""
                     if len(pending) > HOLD_BACK:
                         emit, pending = _split_pending(pending)
                         await _flush(emit)
                 token = await _next_token()
         except asyncio.CancelledError:
             raise
+        if not committed:
+            # The stream ended while the reply was still short and had no
+            # question in it: a dead end. Replace it before anything is
+            # spoken, unless the caller is already wrapping up.
+            if not closing and is_dead_end(gate):
+                log_event("dead_end_guard", callSid=call_sid, text=gate.strip())
+                full = DEAD_END_RECOVERIES[0]
+                if _norm_text(prev_assistant) == _norm_text(full):
+                    full = DEAD_END_RECOVERIES[1]
+                await _flush(full)
+                gate = ""
+            pending += gate
         await _flush(pending)
         await websocket.send_json(
             {
@@ -1422,6 +1500,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                 # The caller is talking again: re-arm the idle prompt.
                 caller_spoke = True
                 idle_prompted = False
+                state["caller_turns"] += 1
                 history.append({"role": "user", "content": user_text})
 
                 # Caller asked for a person: hand off instead of answering.
@@ -1455,16 +1534,15 @@ async def relay_ws(websocket: WebSocket) -> None:
                         )
                         log_event("interrupt_ack", callSid=call_sid, text=ack)
 
-                # Outbound + positive answer to "do you have a minute?":
-                # speak the recording notice now, non-interruptible. It is
-                # appended to history only AFTER the reply (appending it here
-                # would leave history ending in "assistant", which Mistral
+                # Outbound: speak the recording notice early, non-interruptible.
+                # It is appended to history only AFTER the reply (appending it
+                # here would leave history ending in "assistant", which Mistral
                 # rejects with HTTP 400).
                 notice_to_log = None
                 if (
                     is_outbound
                     and not state["recording_disclosed"]
-                    and is_affirmative(user_text)
+                    and should_disclose_recording(user_text, state["caller_turns"])
                 ):
                     state["recording_disclosed"] = True
                     notice_to_log = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
@@ -1584,9 +1662,19 @@ async def relay_ws(websocket: WebSocket) -> None:
                 save_call_state()
 
                 spoken_box[0] = ""
+                prev_assistant = next(
+                    (m["content"] for m in reversed(history) if m["role"] == "assistant"),
+                    "",
+                )
+                closing = bool(CLOSING_RE.search(user_text))
                 try:
                     llm_task = asyncio.create_task(
-                        send_text_tokens(mistral_stream_reply(history), spoken_box)
+                        send_text_tokens(
+                            mistral_stream_reply(history),
+                            spoken_box,
+                            prev_assistant=prev_assistant,
+                            closing=closing,
+                        )
                     )
                     reply = ""
                     # Race the LLM task against incoming Twilio messages so an
@@ -1682,18 +1770,13 @@ async def relay_ws(websocket: WebSocket) -> None:
                     llm_task = None
 
                 if reply:
-                    prev_assistant = next(
-                        (m["content"] for m in reversed(history) if m["role"] == "assistant"),
-                        "",
-                    )
                     if is_repeat(prev_assistant, reply.strip()):
+                        # History-level backstop only: the caller has already
+                        # heard this reply, so this keeps the model from
+                        # seeing its own loop on the next turn. What the
+                        # caller hears is decided by the pre-speech gate in
+                        # send_text_tokens.
                         log_event("repeat_guard", callSid=call_sid)
-                        # The model looped its own last line, which almost
-                        # always means it did not understand the caller. Ask
-                        # for a repeat: the old fallback jumped to a callback
-                        # offer, which on a live call derailed the name
-                        # capture ("I'm listening." -> "would you like the
-                        # store to call you back?").
                         reply = REPEAT_FALLBACKS[0]
                         if _norm_text(prev_assistant) == _norm_text(reply):
                             reply = REPEAT_FALLBACKS[1]
