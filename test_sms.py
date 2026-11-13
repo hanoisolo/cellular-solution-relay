@@ -128,10 +128,16 @@ def main():
     check("ConversationRelay ignoreBackchannel + dtmfDetection enabled",
           cr.get("ignoreBackchannel") == "true" and cr.get("dtmfDetection") == "true",
           f"attrs: {dict(cr.attrib)}")
+    # "EID" is deliberately absent: it is the eSIM identifier and it biased
+    # the recognizer toward "Eid" when callers asked for Ed (CA7f9eff0). The
+    # staff names replace it, so a caller asking for a person is understood.
     check("ConversationRelay hints cover carriers + device IDs + store number",
           all(w in (cr.get("hints") or "")
-              for w in ("Bell", "Rogers", "Telus", "eSIM", "EID", "IMEI", "EPP", "905-264-2228")),
+              for w in ("Bell", "Rogers", "Telus", "eSIM", "IMEI", "EPP",
+                        "905-264-2228", "Neelam", "Dwayne", "Ed")),
           f"hints: {cr.get('hints')}")
+    check("ConversationRelay hints do not bias 'Ed' toward 'EID'",
+          "EID" not in (cr.get("hints") or ""), f"hints: {cr.get('hints')}")
     check("ConversationRelay keeps reconnect + no welcomeGreeting attr",
           cr.get("applicationReconnect") == "true" and cr.get("welcomeGreeting") in (None, ""),
           f"attrs: {dict(cr.attrib)}")
@@ -409,6 +415,28 @@ def main():
               route is not None and route[0] == expected,
               f"{route!r}")
 
+    # The recognizer does not spell names the way the caller says them. These
+    # are the exact transcripts from live calls where the handoff never fired
+    # and the model answered as if the caller had said something else:
+    # "Eid." -> "Eid Mubarak!" (CA7f9eff0), "Noom"/"numb"/"NM" -> "Noom is
+    # available through Bell mobility plans" and "I can't transfer calls"
+    # (CA47b56c7, CA613c343). A mangled name must still reach the person.
+    for text, expected in (
+        ("Eid.", "231"),
+        ("Can you transfer me to NM?", "226"),
+        ("I'm looking for Noom.", "226"),
+        ("Can you transfer me to numb?", "226"),
+        ("Is Neelum there?", "226"),
+        ("Neel please", "226"),
+        ("Duane please", "232"),
+        ("Dwain there?", "232"),
+        ("I want to talk to Eid", "231"),
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route STT variant {text!r} -> {expected}",
+              route is not None and route[0] == expected,
+              f"{route!r}")
+
     # A name beats a department: the caller asked for a person, and that
     # person's extension is the one that reaches them.
     route = server.handoff_route("I need Ed in accounts payable")
@@ -570,12 +598,78 @@ def main():
               not server.CLOSING_RE.search(fallback), fallback)
         check("availability fallback does not itself claim availability",
               server.claims_staff_availability(fallback) is False, fallback)
+    # --- Transfer denials: the relay CAN transfer, so "I can't transfer
+    # calls" is a fabrication about the agent's own capability. On CA47b56c7
+    # the caller asked "Can you transfer me to numb?" and heard exactly that,
+    # then hung up. ---
+    for denial in (
+        "I can't transfer calls.",
+        "I cannot transfer you.",
+        "I'm unable to connect you.",
+        "I am not able to transfer this call.",
+        "I don't have the ability to transfer calls.",
+        "There's no way to transfer you from here.",
+    ):
+        check(f"TRANSFER_DENIAL_RE matches {denial!r}",
+              server.TRANSFER_DENIAL_RE.search(denial) is not None, denial)
+    for clean in (
+        "",
+        "I can transfer you to the store.",
+        "Let me put you through to the store.",
+        "The store can transfer your number to Bell.",
+        "I can connect you with the EPP desk.",
+        # The fallbacks themselves must never trip the guard, or it loops.
+        *server.TRANSFER_FALLBACKS,
+    ):
+        check(f"TRANSFER_DENIAL_RE ignores {clean!r}",
+              server.TRANSFER_DENIAL_RE.search(clean) is None, clean)
+    check("_gate_commits holds a transfer denial",
+          server._gate_commits("I can't transfer calls. Would you like the "
+                               "store to call you back?") is False,
+          "committed")
+    check("_gate_commits lets the transfer fallback through",
+          server._gate_commits(server.TRANSFER_FALLBACKS[0]) is True, "held")
+    for fallback in server.TRANSFER_FALLBACKS:
+        check("transfer fallback is an open turn", "?" in fallback, fallback)
+        check("transfer fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
+        check("transfer fallback does not itself deny a transfer",
+              server.TRANSFER_DENIAL_RE.search(fallback) is None, fallback)
+    # A caller asking to be put through is connected, not answered — even when
+    # the destination is not one of the published extensions.
+    for text in (
+        "Can you transfer me to billing?",
+        "Please connect me to someone in support",
+        "Can you put me through to the store?",
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route transfer request {text!r} -> 225",
+              route is not None and route[0] == "225", f"{route!r}")
+    # ...but a port-in question is not a transfer request.
+    for text in (
+        "Can I transfer my number to Bell?",
+        "How do I transfer my number over?",
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route port-in {text!r} -> no handoff",
+              route is None, f"{route!r}")
+
     # HANDOFF_PEOPLE drives the guard, so it must stay in step with the
     # routing table or a renamed colleague silently loses the guard.
     route_labels = {label for _, label, _ in server.HANDOFF_ROUTES}
     for person in server.HANDOFF_PEOPLE:
         check(f"HANDOFF_PEOPLE {person!r} is a route label",
               person in route_labels, f"{sorted(route_labels)}")
+
+    # The hints bias the recognizer, so every name a caller can ask for must
+    # be in them or the name arrives mangled and the handoff never fires.
+    # "EID" must NOT be there: it is the eSIM identifier, and it pulled "Ed"
+    # toward "Eid" on CA7f9eff0.
+    hints = [h.strip() for h in server.DEFAULT_HINTS.split(",")]
+    for person in server.HANDOFF_PEOPLE:
+        check(f"DEFAULT_HINTS contains {person!r}", person in hints, hints)
+    check("DEFAULT_HINTS does not bias 'Ed' toward 'EID'",
+          "EID" not in hints, hints)
 
     # --- is_repeat(): a reworded repeat can be the previous reply with a
     # clause added or dropped. On CAdc6292 the agent asked the callback

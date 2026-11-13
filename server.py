@@ -64,10 +64,17 @@ RELAY_STT_PROVIDER = os.environ.get("RELAY_STT_PROVIDER", "Google")
 
 # Speech-recognition hints: words the recognizer should expect on this line
 # of business. Overridable at runtime with RELAY_HINTS (Railway var).
+# ConversationRelay STT bias list. The staff names are here because callers ask
+# for them by name and the recognizer was mangling them: on live calls "Ed"
+# came back as "Eid" (CA7f9eff0) and "Neelam" as "Noom", "numb" and "NM"
+# (CA47b56c7, CA613c343), so the handoff never fired and the model answered as
+# if the caller had said something else — "Eid Mubarak!", "Noom is available
+# through Bell mobility plans". "EID" was removed for the same reason: it is
+# the eSIM identifier, and it pulled "Ed" toward "Eid".
 DEFAULT_HINTS = (
-    "Bell, Rogers, Telus, Koodo, Fido, Virgin, Freedom, eSIM, EID, IMEI, "
+    "Bell, Rogers, Telus, Koodo, Fido, Virgin, Freedom, eSIM, IMEI, "
     "EPP, Employee Purchase Program, mobility, plans, promotions, autopay, "
-    "port-in, callback, 905-264-2228"
+    "port-in, callback, 905-264-2228, Neelam, Dwayne, Ed"
 )
 
 
@@ -479,6 +486,10 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
     # hear it.
     if claims_staff_availability(t):
         return False
+    # A denial of the relay's own transfer capability is false — the handoff
+    # dials the store's extension — so hold it the same way.
+    if TRANSFER_DENIAL_RE.search(t):
+        return False
     # A closing commits at once: holding it to end-of-stream only delays a
     # goodbye, and is_dead_end no longer treats it as a dead end.
     if CLOSING_RE.search(t):
@@ -588,6 +599,30 @@ AVAILABILITY_FALLBACKS = (
 )
 
 
+# The relay CAN transfer: handoff_route() dials the store's extension before
+# the model is ever called. So a reply that says it cannot transfer is a
+# fabrication about the agent's own capability. On CA47b56c7 a caller asked
+# "Can you transfer me to numb?" and the agent answered "I can't transfer
+# calls." — the caller hung up. The request net below means such a caller is
+# connected instead of answered; this guard is the backstop for any remaining
+# denial, so the words are never spoken.
+TRANSFER_DENIAL_RE = re.compile(
+    r"\b(?:can'?t|cannot|can not|unable to|not able to|no way to|"
+    r"don'?t have the (?:ability|option|capability) to|"
+    r"am not able to|do not have the (?:ability|option|capability) to)\s+"
+    r"(?:transfer|connect|put (?:you|them) through|forward)\b",
+    re.IGNORECASE,
+)
+
+# Spoken instead of the denial. Both end in a question so the dead-end guard
+# leaves them alone, and neither matches CLOSING_RE so a fallback can never
+# end the call.
+TRANSFER_FALLBACKS = (
+    "The store can help with that — would you like them to call you back?",
+    "I can have the store reach out to you about that. Would that work?",
+)
+
+
 def claims_staff_availability(reply: str) -> bool:
     """True when the reply says whether a named colleague is available.
 
@@ -622,6 +657,31 @@ def _availability_at(spoken: str, pending: str) -> int | None:
     if not claims_staff_availability(window):
         return None
     m = AVAILABILITY_CLAIM_RE.search(window)
+    if not m:
+        return None
+    start = m.start()
+    cut = max(
+        window.rfind(". ", 0, start),
+        window.rfind("? ", 0, start),
+        window.rfind("! ", 0, start),
+    )
+    if cut != -1:
+        start = cut + 2
+    return max(0, start - len(tail))
+
+
+def _transfer_denial_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where a "I can't transfer you" denial starts, or None.
+
+    Same shape as _availability_at: the pre-speech gate only holds a reply
+    until it commits, so a denial arriving after the commit point would stream
+    out unfiltered. The cut backs up to the start of the sentence holding the
+    denial so the caller does not hear a dangling fragment.
+    """
+    look = 64
+    tail = (spoken or "")[-look:]
+    window = tail + (pending or "")
+    m = TRANSFER_DENIAL_RE.search(window)
     if not m:
         return None
     start = m.start()
@@ -794,6 +854,10 @@ SYSTEM_PROMPT = (
     "department — EPP is handled by this assistant and by the store at "
     "905-264-2228. Offer to check eligibility on the website or to arrange "
     "a store callback. "
+    "Never say you cannot transfer or connect a call. You can: the phone "
+    "system puts callers through to the store. If a caller asks to be "
+    "transferred, say you are connecting them and stop talking — do not "
+    "answer their question yourself. "
     "Pronunciation: always say the website as 'cellular solution dot c a' — "
     "two words, cellular and solution. Never say 'w w w' or 'triple w'. "
     "Never repeat a previous reply, in whole or in part. Say the website "
@@ -962,6 +1026,18 @@ MOCK_REPLIES = {
     "availref_late": (
         "Would you like the store to call you back? Ed isn't available right now."
     ),
+    # A denial of the relay's own transfer capability, so the transfer-denial
+    # guard can be exercised end-to-end. The denial is the FIRST sentence, so
+    # the pre-speech gate holds it. Only reachable in MOCK_LLM mode.
+    "canttransferref": (
+        "I can't transfer calls. Would you like the store to call you back "
+        "about Bell's Employee Purchase Program?"
+    ),
+    # The same denial AFTER a sentence that commits the pre-speech gate, so
+    # only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "canttransferref_late": (
+        "Would you like the store to call you back? I can't transfer calls."
+    ),
 }
 
 
@@ -1011,6 +1087,10 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["availref_late"]
     if "availref" in lowered:
         return MOCK_REPLIES["availref"]
+    if "canttransferref_late" in lowered:
+        return MOCK_REPLIES["canttransferref_late"]
+    if "canttransferref" in lowered:
+        return MOCK_REPLIES["canttransferref"]
     if "takecareref" in lowered:
         return MOCK_REPLIES["takecare"]
     if "pitchref" in lowered:
@@ -1256,9 +1336,19 @@ HANDOFF_RE = re.compile(
 # NOT here: a sales prospect asking "what's the monthly payment?" must not be
 # routed to accounts receivable.
 HANDOFF_ROUTES = (
-    ("226", "Neelam", re.compile(r"\bneelam\b", re.IGNORECASE)),
-    ("232", "Dwayne", re.compile(r"\bdwayne\b", re.IGNORECASE)),
-    ("231", "Ed", re.compile(r"\bed\b", re.IGNORECASE)),
+    (
+        "226",
+        "Neelam",
+        re.compile(
+            r"\b(?:neelam|neelum|neel|neela|nila|noom|numb|nm)\b", re.IGNORECASE
+        ),
+    ),
+    (
+        "232",
+        "Dwayne",
+        re.compile(r"\b(?:dwayne|dwain|duane|dwane|dwayn)\b", re.IGNORECASE),
+    ),
+    ("231", "Ed", re.compile(r"\b(?:ed|eid)\b", re.IGNORECASE)),
     (
         "220",
         "accounts receivable",
@@ -1316,6 +1406,18 @@ def handoff_digit_pause(extension: str = "") -> str:
     return "w" * halves
 
 
+# A caller asking to be transferred, whatever name they use. The named routes
+# above catch the destinations the store publishes; this catches the rest
+# ("transfer me to billing", "can you connect me") so the caller is connected
+# to the store instead of being told the agent cannot transfer. Deliberately
+# requires "me"/"us"/"this call" after the verb: "can I transfer my number to
+# Bell?" is a port-in question, not a request to be put through.
+TRANSFER_REQUEST_RE = re.compile(
+    r"\b(?:transfer|connect|put)\s+(?:me|us)\b|\btransfer\s+(?:this|the)\s+call\b",
+    re.IGNORECASE,
+)
+
+
 def handoff_route(user_text: str, is_outbound: bool = False) -> tuple[str, str] | None:
     """The (extension, spoken label) for this turn, or None to keep talking.
 
@@ -1331,6 +1433,8 @@ def handoff_route(user_text: str, is_outbound: bool = False) -> tuple[str, str] 
         if pattern.search(t):
             return extension, label
     if HANDOFF_RE.search(t):
+        return DEFAULT_HANDOFF_ROUTE
+    if TRANSFER_REQUEST_RE.search(t):
         return DEFAULT_HANDOFF_ROUTE
     return None
 
@@ -2233,6 +2337,25 @@ async def relay_ws(websocket: WebSocket) -> None:
                             full = AVAILABILITY_FALLBACKS[0]
                             await _flush(full)
                             break
+                        denial = _transfer_denial_at(
+                            spoken_box[0] if spoken_box is not None else "", pending
+                        )
+                        if denial is not None:
+                            # A denial of the relay's own transfer capability is
+                            # about to be spoken. Same treatment: say the safe
+                            # prefix, then the fallback, and drop the rest.
+                            safe = pending[:denial]
+                            pending = ""
+                            if safe:
+                                await _flush(safe)
+                            log_event(
+                                "transfer_denial_guard",
+                                callSid=call_sid,
+                                text=full.strip(),
+                            )
+                            full = TRANSFER_FALLBACKS[0]
+                            await _flush(full)
+                            break
                         emit, pending = _split_pending(pending)
                         await _flush(emit)
                 token = await _next_token()
@@ -2260,6 +2383,15 @@ async def relay_ws(websocket: WebSocket) -> None:
                     "forbidden_question_guard", callSid=call_sid, text=gate.strip()
                 )
                 replacement = CALLBACK_QUESTION_FALLBACK
+            elif TRANSFER_DENIAL_RE.search(gate):
+                log_event(
+                    "transfer_denial_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = TRANSFER_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = TRANSFER_FALLBACKS[1]
             elif repeated is not None:
                 # A repeat in answer to a clear question is an ANSWER, not a
                 # loop: the post-pitch prompt tells the model what to say when
