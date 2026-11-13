@@ -245,7 +245,7 @@ def main():
     # A plain hangup also fires the action URL. Dialling the store then rings a
     # live line for a caller who is already gone, so a terminal CallStatus with
     # no HandoffData must return empty TwiML instead.
-    for status in ("completed", "busy", "failed", "no-answer", "canceled"):
+    for status in ("completed", "busy", "failed", "no-answer", "canceled", "ringing"):
         r = post_signed("/handoff", {"CallSid": "CA123", "CallStatus": status}, "tok-123")
         root = ET.fromstring(r.content)
         check(f"POST /handoff hangup (CallStatus={status}) -> no Dial",

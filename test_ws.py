@@ -474,6 +474,29 @@ def check_forbidden_question():
     assert not FORBIDDEN_QUESTION_RE.search(CALLBACK_QUESTION_FALLBACK), (
         "the fallback question trips its own guard"
     )
+
+    # The gate only holds a reply until it commits, so a forbidden question
+    # that arrives AFTER the commit point needs the chunk scan. "Sure, I can
+    # help with that." commits at six words; the question follows it.
+    from server import _forbidden_at
+
+    late = "Sure, I can help with that. Are you with a company that offers EPP?"
+    assert _gate_commits("Sure, I can help with that."), (
+        "the safe prefix no longer commits, so this test is not exercising "
+        "the post-commit path"
+    )
+    hit = _forbidden_at("", late)
+    assert hit is not None and late[hit:].lower().startswith("are you with"), (
+        f"the late forbidden question was not located: {hit!r}"
+    )
+    # A match that straddles the last flush is still found: the lookback
+    # covers the tail of what was already spoken.
+    assert _forbidden_at("Sure, I can help with that. Are you wi", "th a company") is not None, (
+        "a forbidden question split across two flushes was missed"
+    )
+    # Clean text must not be flagged, or every reply would be truncated.
+    assert _forbidden_at("", "The store is open Monday to Friday, 9am to 5pm.") is None
+    assert _forbidden_at("Would you like a callback? ", "The store can confirm.") is None
     print("FORBIDDEN QUESTION CHECKS: pass — unanswerable questions are held")
 
 
@@ -1022,6 +1045,121 @@ async def check_forbidden_question_ws():
     print("FORBIDDEN QUESTION WS: pass — replaced before it was spoken")
 
 
+async def check_forbidden_question_late_ws():
+    """End-to-end: a forbidden question that arrives AFTER the pre-speech gate
+    has committed must still never be spoken. The gate commits at the first
+    question mark or after three words, so "Sure, I can help with that. Are you
+    with a company that offers EPP?" used to stream out unfiltered."""
+    from server import CALLBACK_QUESTION_FALLBACK  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000016"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps({"type": "prompt", "voicePrompt": "badqlate", "last": True})
+        )
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        spoken = "".join(tokens).strip()
+        assert "are you with" not in spoken.lower(), (
+            f"the late forbidden question was spoken: {spoken!r}"
+        )
+        assert CALLBACK_QUESTION_FALLBACK in spoken, (
+            f"the callback question was not substituted: {spoken!r}"
+        )
+    print("FORBIDDEN QUESTION (late): pass — caught after the commit point")
+
+
+async def check_pitch_turn_capture_ws():
+    """A caller who volunteers their name and number on the FIRST outbound turn
+    must still have the callback captured.
+
+    The relay speaks the pitch on that turn, and the pitch block used to
+    `continue` before the name/phone extraction ran, so "Hi, this is Don, my
+    number is 416-555-0100" was pitched at and then silently dropped: no
+    CALLBACK_REQUEST, no store SMS, and an empty handoff payload. The handoff
+    payload is the observable end of that pipeline, so this asserts on it.
+    """
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000017"
+    setup["direction"] = "outbound-api"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Hi, this is Don, my number is 416-555-0100.",
+                    "last": True,
+                }
+            )
+        )
+        from server import OUTBOUND_PITCH  # noqa: E402
+
+        # The greeting and the recording notice are non-interruptible and also
+        # end with last=true, so collect until the first INTERRUPTIBLE final
+        # token: that is the pitch.
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text":
+                continue
+            tokens.append(m)
+            if m.get("last") is True and m.get("interruptible") is not False:
+                break
+        spoken = "".join(
+            m.get("token") or ""
+            for m in tokens
+            if m.get("interruptible") is not False
+        ).strip()
+        assert spoken == OUTBOUND_PITCH, (
+            f"the pitch turn did not speak the pitch: {spoken!r}"
+        )
+        # Ask for a person: the handoff payload must carry what the caller
+        # already gave on the pitch turn.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Can I speak to a representative?",
+                    "last": True,
+                }
+            )
+        )
+        end_msg = None
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") == "end":
+                end_msg = m
+                break
+        assert end_msg is not None, "no end message after the handoff request"
+        hd = json.loads(end_msg.get("handoffData") or "{}")
+        cb = hd.get("callback") or {}
+        assert cb.get("name") == "Don", (
+            f"the name given on the pitch turn was lost: {hd}"
+        )
+        assert cb.get("phone") == "+14165550100", (
+            f"the number given on the pitch turn was lost: {hd}"
+        )
+    print("PITCH TURN CAPTURE: pass — name and number survive the pitch turn")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -1324,9 +1462,11 @@ async def main():
     # A dead-end reply from the model ("Okay.") must be replaced with a next
     # step, not spoken as-is. A live call said "Okay." and "Alright." twice in
     # a row after the caller declined the callback.
+    # Inbound: on an outbound call the first turn is the relay's own pitch, so
+    # the model never gets the turn and this check would pass vacuously.
     setup6 = dict(SETUP)
     setup6["callSid"] = "CAtest0000000000000000000000000005"
-    setup6["direction"] = "outbound-api"
+    setup6["direction"] = "inbound"
     async with websockets.connect(WS_URL, max_size=2**20) as ws6:
         await ws6.send(json.dumps(setup6))
         await asyncio.sleep(0.5)
@@ -1468,6 +1608,8 @@ async def main():
     await check_pitch_phase_ws()
     await check_ack_suppression()
     await check_forbidden_question_ws()
+    await check_forbidden_question_late_ws()
+    await check_pitch_turn_capture_ws()
     print("\nALL TESTS PASSED")
 
 

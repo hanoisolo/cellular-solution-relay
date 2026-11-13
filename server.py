@@ -302,6 +302,24 @@ def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+def _forbidden_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where a forbidden question starts, or None.
+
+    The pre-speech gate only holds a reply until it commits, so a forbidden
+    question that arrives AFTER the commit point ("Sure, I can help. Are you
+    with a company that offers EPP?") would stream out unfiltered. This scans
+    the not-yet-spoken text before each flush. The lookback covers a match
+    that straddles the last flush: the longest pattern is ~20 chars, so 32
+    chars of already-spoken text is enough.
+    """
+    look = 32
+    tail = (spoken or "")[-look:]
+    m = FORBIDDEN_QUESTION_RE.search(tail + (pending or ""))
+    if not m:
+        return None
+    return max(0, m.start() - len(tail))
+
+
 # Near-duplicate repeat detection. Replies shorter than REPEAT_MIN_CHARS are
 # compared exactly only, so ordinary short answers are never flagged. A long
 # reply counts as a repeat when it is either mostly the same text
@@ -626,6 +644,11 @@ MOCK_REPLIES = {
     # A question the caller cannot answer, so the guard can be exercised
     # end-to-end. Only reachable in MOCK_LLM mode.
     "badq": "Are you with a company that offers EPP?",
+    # The same question AFTER a sentence that commits the pre-speech gate, so
+    # only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "badq_late": (
+        "Sure, I can help with that. Are you with a company that offers EPP?"
+    ),
     # Report which outbound prompt phase the model is being given.
     "pitch_seen": "Yes, the post-pitch prompt is in place.",
     "pitch_missing": "No, the pre-pitch prompt is still in place.",
@@ -648,6 +671,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["pitch_seen"] if swapped else MOCK_REPLIES["pitch_missing"]
     if "pitchme" in lowered:
         return MOCK_REPLIES["pitch"]
+    if "badqlate" in lowered:
+        return MOCK_REPLIES["badq_late"]
     if "badq" in lowered:
         return MOCK_REPLIES["badq"]
     if "noteref" in lowered:
@@ -1165,11 +1190,12 @@ async def twiml_outbound(request: Request) -> Response:
     return await _twiml_response(request)
 
 
-# CallStatus values that mean the caller is already gone. <Connect>'s action
-# URL fires on a plain hangup as well as on a handoff, so these are the cases
-# where dialling the store would ring a live line for nobody.
-TERMINAL_CALL_STATUSES = frozenset(
-    {"completed", "busy", "failed", "no-answer", "canceled", "cancelled"}
+# CallStatus values that mean there is no caller left to connect. <Connect>'s
+# action URL fires on a plain hangup as well as on a handoff, so these are the
+# cases where dialling the store would ring a live line for nobody. "ringing"
+# is here because a leg that never connected has no caller on it either.
+NO_CALLER_STATUSES = frozenset(
+    {"completed", "busy", "failed", "no-answer", "canceled", "cancelled", "ringing"}
 )
 
 
@@ -1200,7 +1226,7 @@ async def handoff_action(request: Request) -> Response:
     # rings a live line for a caller who is already gone, and the store picks
     # up silence. Only dial when the relay asked for a handoff (HandoffData) or
     # the call is still up; an absent CallStatus keeps the old behaviour.
-    if not handoff_data and call_status in TERMINAL_CALL_STATUSES:
+    if not handoff_data and call_status in NO_CALLER_STATUSES:
         log_event(
             "handoff_skipped_call_ended",
             callSid=params.get("CallSid", ""),
@@ -1572,6 +1598,26 @@ async def relay_ws(websocket: WebSocket) -> None:
                             pending += gate
                             gate = ""
                     if len(pending) > HOLD_BACK:
+                        hit = _forbidden_at(
+                            spoken_box[0] if spoken_box is not None else "", pending
+                        )
+                        if hit is not None:
+                            # A forbidden question is about to be spoken. Say
+                            # the safe prefix, then the fallback, and drop the
+                            # rest of the stream: the caller must never hear
+                            # a question only the store can answer.
+                            safe = pending[:hit]
+                            pending = ""
+                            if safe:
+                                await _flush(safe)
+                            log_event(
+                                "forbidden_question_guard",
+                                callSid=call_sid,
+                                text=full.strip(),
+                            )
+                            full = CALLBACK_QUESTION_FALLBACK
+                            await _flush(full)
+                            break
                         emit, pending = _split_pending(pending)
                         await _flush(emit)
                 token = await _next_token()
@@ -1795,37 +1841,6 @@ async def relay_ws(websocket: WebSocket) -> None:
                     await send_speech(notice_to_log, True, False, "notice")
                     log_event("recording_disclosed", callSid=call_sid)
 
-                # Outbound: the relay speaks the pitch itself, so its length is
-                # fixed and it can never be re-pitched. The model used to
-                # generate it and produced a 505-char monologue (~39s of audio)
-                # with the callback offer at char 430 (live call CA7d8e6e).
-                # Skipped on a clear decline: a "no" must not be pitched at.
-                if (
-                    is_outbound
-                    and not state["pitch_delivered"]
-                    and not NEGATIVE_RE.search(user_text)
-                ):
-                    spoken_pitch = _speakable_text(OUTBOUND_PITCH)
-                    await send_speech(spoken_pitch, True, True, "reply")
-                    history.append({"role": "assistant", "content": spoken_pitch})
-                    state["recent_replies"].append(spoken_pitch)
-                    del state["recent_replies"][:-RECENT_REPLIES_KEPT]
-                    _swap_to_after_pitch(history, state, call_sid)
-                    if notice_to_log:
-                        history.append({"role": "assistant", "content": notice_to_log})
-                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
-                        del history[1]
-                    log_event(
-                        "pitch_spoken",
-                        callSid=call_sid,
-                        chars=len(spoken_pitch),
-                        est_playback_s=round(
-                            estimate_speech_seconds(spoken_pitch), 1
-                        ),
-                    )
-                    save_call_state()
-                    continue
-
                 # Bare-name reply: the assistant just asked for the name and
                 # the caller answered with the name alone ("Jonathan."), or
                 # the caller volunteered a bare first name after a callback
@@ -1924,6 +1939,50 @@ async def relay_ws(websocket: WebSocket) -> None:
                             ),
                         },
                     )
+
+                # Outbound: the relay speaks the pitch itself, so its length is
+                # fixed and it can never be re-pitched. The model used to
+                # generate it and produced a 505-char monologue (~39s of audio)
+                # with the callback offer at char 430 (live call CA7d8e6e).
+                # Skipped on a clear decline or a goodbye: a caller who is
+                # leaving must not be pitched at.
+                #
+                # This runs AFTER the name/phone extraction above on purpose: a
+                # caller whose first words are "I'm Don, 416-555-0100" must
+                # still have the callback captured, and the pitch turn used to
+                # `continue` before any of that ran.
+                if (
+                    is_outbound
+                    and not state["pitch_delivered"]
+                    and not NEGATIVE_RE.search(user_text)
+                    and not CLOSING_RE.search(user_text)
+                ):
+                    spoken_pitch = _speakable_text(OUTBOUND_PITCH)
+                    # Flag the phase and persist BEFORE speaking: a socket drop
+                    # between the send and the save would restore
+                    # pitch_delivered=False and re-pitch on reconnect.
+                    _swap_to_after_pitch(history, state, call_sid)
+                    save_call_state()
+                    await send_speech(spoken_pitch, True, True, "reply")
+                    # The notice was spoken before the pitch, so it goes into
+                    # history first: the model reads the turn in the order the
+                    # caller heard it.
+                    if notice_to_log:
+                        history.append({"role": "assistant", "content": notice_to_log})
+                    history.append({"role": "assistant", "content": spoken_pitch})
+                    state["recent_replies"].append(spoken_pitch)
+                    del state["recent_replies"][:-RECENT_REPLIES_KEPT]
+                    while len(history) > 1 + MAX_HISTORY_MESSAGES:
+                        del history[1]
+                    log_event(
+                        "pitch_spoken",
+                        callSid=call_sid,
+                        chars=len(spoken_pitch),
+                        est_playback_s=round(
+                            estimate_speech_seconds(spoken_pitch), 1
+                        ),
+                    )
+                    continue
 
                 # The caller cut the assistant off last turn. The truncated
                 # assistant turn no longer reads as "I already said this", so
