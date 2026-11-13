@@ -116,6 +116,33 @@ RECORDING_DISCLOSURE = (
     "Just so you know, this call is being recorded for quality assurance."
 )
 
+# Spoken when the caller goes quiet mid-call. ConversationRelay sends nothing
+# on silence, so without this the call sits in dead air until the caller hangs
+# up. Armed only after the caller has spoken once: before that the opening is
+# still playing and a prompt would talk over it. Runtime-overridable with
+# RELAY_IDLE_AFTER (seconds, 0 disables) and RELAY_IDLE_TEXT.
+IDLE_TEXT = "Are you still there?"
+
+# Short acknowledgement spoken when the caller talks over the agent, so the
+# interruption sounds like a person yielding the floor instead of the agent
+# going dead mid-sentence. Spoken on the prompt that FOLLOWS the interrupt,
+# never at the interrupt itself: Twilio fires "interrupt" the moment the
+# caller starts talking, so speaking then would talk over them. Rotated so a
+# caller who interrupts twice does not hear the same word twice.
+# Pipe-separated; an explicitly empty RELAY_INTERRUPT_ACK disables it.
+INTERRUPT_ACKS = "Sure.|Go ahead.|Of course."
+
+# Minimum seconds between acknowledgements, so rapid-fire interruptions do
+# not turn into "Sure. Sure. Sure."
+INTERRUPT_ACK_COOLDOWN = 2.0
+
+
+def interrupt_acks() -> list[str]:
+    """Acknowledgements to rotate through. An explicitly empty
+    RELAY_INTERRUPT_ACK disables them (returns an empty list)."""
+    raw = os.environ.get("RELAY_INTERRUPT_ACK", INTERRUPT_ACKS)
+    return [a.strip() for a in raw.split("|") if a.strip()]
+
 AFFIRMATIVE_RE = re.compile(
     r"\b(yes|yeah|yep|sure|okay|ok|go ahead|absolutely|of course|"
     r"i have a minute|one minute|just a minute|a minute|i do)\b",
@@ -355,7 +382,29 @@ def _mock_reply_for(history: list[dict]) -> str:
 # In-memory conversation history per callSid, so a dropped WebSocket can
 # reconnect (applicationReconnect=true) and pick up where it left off.
 SESSIONS: dict[str, list[dict]] = {}
+# Per-call state that is NOT conversation history: the callback details the
+# caller has already dictated, and the flags that decide whether a notice or
+# a name prompt is still owed. These used to be locals of the WebSocket
+# handler, so a reconnect silently reset them: a caller who had already given
+# their name and number lost them (no CALLBACK_REQUEST, no store SMS, and a
+# handoff payload with no callback), and an outbound call could repeat the
+# recording notice. Kept beside SESSIONS and restored on reconnect.
+CALL_STATE: dict[str, dict] = {}
 MAX_SESSIONS = 100
+
+
+def new_call_state() -> dict:
+    """Fresh per-call state for a new (non-reconnect) session."""
+    return {
+        "callback_name": None,
+        "callback_phone": None,
+        "callback_logged": False,
+        "phone_buffer": "",
+        "expecting_name": False,
+        "callback_offered": False,
+        "recording_disclosed": False,
+    }
+
 # Voice history per call keeps only the system prompt plus the most recent
 # turns, so each Mistral request stays small and fast on long calls.
 MAX_HISTORY_MESSAGES = 20
@@ -1000,38 +1049,46 @@ async def relay_ws(websocket: WebSocket) -> None:
 
     call_sid = ""
     history: list[dict] = [{"role": "system", "content": with_offers(_env_or("RELAY_SYSTEM_PROMPT", SYSTEM_PROMPT))}]
-    callback_name: str | None = None
-    callback_phone: str | None = None
-    callback_logged = False
-    # Piecemeal phone dictation: callers often give the number in chunks
-    # ("289." ... "901." ... "0990"). Digit groups of 3+ accumulate here;
-    # once 10 digits are banked, the number is captured (last 10, so a
-    # restarted dictation wins over the abandoned prefix).
-    phone_buffer = ""
-    # Set when the assistant just asked for the caller's name: the next
-    # short reply ("Jonathan.") IS the name, not a sentence to parse.
-    expecting_name = False
-    # Set once the assistant has offered a callback in this call: a bare
-    # first name volunteered after that point is a name, even if the LLM
-    # asked a different question that turn.
-    callback_offered = False
+    # Per-call state: the callback details the caller has dictated and the
+    # flags for notices/name prompts still owed. Mutated in place and mirrored
+    # into CALL_STATE after every turn, so a reconnect restores it instead of
+    # starting from scratch. Keys are defined in new_call_state().
+    state = new_call_state()
     llm_task: asyncio.Task | None = None
     # Accumulates the text already sent to Twilio for the in-flight reply, so
     # an interrupt can truncate history to what the caller actually heard.
     spoken_box = [""]
     # Outbound calls: recording notice fires on the first affirmative answer.
     is_outbound = False
-    recording_disclosed = False
     # Turn timing: set when a prompt arrives, read by send_text_tokens and the
     # reply path to log first_token / turn_done latencies per turn.
     t_prompt = 0.0
+    # Set when Twilio reports an interruption. The acknowledgement is spoken
+    # on the prompt that follows, not at the interrupt itself (the caller is
+    # still mid-sentence then).
+    interrupted = False
+    ack_index = 0
+    last_ack_at = 0.0
+    # Idle prompt: armed once the caller has spoken, so it can never talk over
+    # the opening. At most one prompt per caller turn.
+    caller_spoke = False
+    idle_prompted = False
+
+    def save_call_state() -> None:
+        """Mirror the per-call state into CALL_STATE so a reconnect restores
+        it. Called after every turn that can change it."""
+        if call_sid:
+            CALL_STATE[call_sid] = dict(state)
 
     async def do_handoff(reason: str, extra: dict | None = None) -> None:
         """End the relay session; Twilio then POSTs the action URL (/handoff)
         and the caller is connected to the store line."""
         payload = {"reason": reason, "callSid": call_sid}
-        if callback_name or callback_phone:
-            payload["callback"] = {"name": callback_name, "phone": callback_phone}
+        if state["callback_name"] or state["callback_phone"]:
+            payload["callback"] = {
+                "name": state["callback_name"],
+                "phone": state["callback_phone"],
+            }
         if extra:
             payload.update(extra)
         log_event("handoff", callSid=call_sid, reason=reason)
@@ -1171,9 +1228,40 @@ async def relay_ws(websocket: WebSocket) -> None:
         )
         return full
 
+    async def next_message() -> dict:
+        """Receive the next Twilio message, speaking the idle prompt if the
+        caller has gone quiet.
+
+        The pending receive is kept rather than cancelled when the timer
+        fires, so a message that lands at the same instant is not dropped.
+        The timer only arms after the caller has spoken once: before that the
+        opening is still playing and a prompt would talk over it.
+        """
+        nonlocal idle_prompted
+        idle_after = float(os.environ.get("RELAY_IDLE_AFTER", "8") or 0)
+        if idle_after <= 0 or not caller_spoke or idle_prompted:
+            return await websocket.receive_json()
+        recv = asyncio.ensure_future(websocket.receive_json())
+        done, _pending = await asyncio.wait({recv}, timeout=idle_after)
+        if not done:
+            idle_prompted = True
+            text = os.environ.get("RELAY_IDLE_TEXT", "") or IDLE_TEXT
+            await websocket.send_json(
+                {
+                    "type": "text",
+                    "token": text,
+                    "last": True,
+                    "interruptible": True,
+                    "preemptible": False,
+                }
+            )
+            log_event("idle_prompt", callSid=call_sid, text=text)
+            await asyncio.wait({recv})
+        return recv.result()
+
     try:
         while True:
-            message = await websocket.receive_json()
+            message = await next_message()
             msg_type = message.get("type")
 
             if msg_type == "setup":
@@ -1186,12 +1274,21 @@ async def relay_ws(websocket: WebSocket) -> None:
                     greeting = _env_or("RELAY_WELCOME_GREETING", WELCOME_GREETING)
                 if connection_type == "reconnect" and call_sid in SESSIONS:
                     history = SESSIONS[call_sid]
+                    # Restore the callback details and owed-notice flags: they
+                    # are not part of the conversation history, so without this
+                    # a reconnect silently dropped a name/number the caller had
+                    # already dictated.
+                    state.update(CALL_STATE.get(call_sid) or new_call_state())
                     log_event(
                         "session_reconnected",
                         callSid=call_sid,
                         turns=len(history),
+                        callback_name=state["callback_name"],
+                        callback_phone=state["callback_phone"],
                     )
                 else:
+                    state.clear()
+                    state.update(new_call_state())
                     # Outbound dials get the outbound system prompt: the
                     # agent called the person, so it must introduce the
                     # call's purpose instead of asking "how can I help you".
@@ -1207,8 +1304,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # what was already said.
                     history.append({"role": "assistant", "content": greeting})
                     SESSIONS[call_sid] = history
+                    CALL_STATE[call_sid] = dict(state)
                     if len(SESSIONS) > MAX_SESSIONS:
-                        SESSIONS.pop(next(iter(SESSIONS)))
+                        evicted = next(iter(SESSIONS))
+                        SESSIONS.pop(evicted)
+                        CALL_STATE.pop(evicted, None)
                 if connection_type != "reconnect":
                     # The opening is spoken as NON-interruptible tokens: with
                     # the TwiML welcomeGreeting attribute a caller saying
@@ -1231,7 +1331,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # Outbound: the greeting already names the AI and ends
                         # with the minute question; the recording notice waits
                         # for a positive answer.
-                        recording_disclosed = False
+                        state["recording_disclosed"] = False
                         opening = greeting
                     else:
                         # Inbound: greeting -> AI + recording disclosure ->
@@ -1244,7 +1344,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         history.append(
                             {"role": "assistant", "content": OPENING_QUESTION}
                         )
-                        recording_disclosed = True
+                        state["recording_disclosed"] = True
                         opening = f"{greeting} {disclosure} {OPENING_QUESTION}"
                     # The opening is spoken by the relay, not the model, so it
                     # never reached the turn log: a transcript could not show
@@ -1267,6 +1367,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                     continue
                 log_event("turn", callSid=call_sid, role="user", text=user_text)
                 t_prompt = time.monotonic()
+                # The caller is talking again: re-arm the idle prompt.
+                caller_spoke = True
+                idle_prompted = False
                 history.append({"role": "user", "content": user_text})
 
                 # Caller asked for a person: hand off instead of answering.
@@ -1276,14 +1379,42 @@ async def relay_ws(websocket: WebSocket) -> None:
                     )
                     return
 
+                # The caller talked over the agent. Acknowledge it before the
+                # answer so the cut sounds like a person yielding the floor
+                # instead of the agent going dead. Interruptible, so a caller
+                # who keeps talking is not talked over in turn. Not added to
+                # history: it is a filler, not something the model said.
+                if interrupted:
+                    interrupted = False
+                    acks = interrupt_acks()
+                    now = time.monotonic()
+                    if acks and now - last_ack_at >= INTERRUPT_ACK_COOLDOWN:
+                        ack = acks[ack_index % len(acks)]
+                        ack_index += 1
+                        last_ack_at = now
+                        await websocket.send_json(
+                            {
+                                "type": "text",
+                                "token": ack,
+                                "last": True,
+                                "interruptible": True,
+                                "preemptible": False,
+                            }
+                        )
+                        log_event("interrupt_ack", callSid=call_sid, text=ack)
+
                 # Outbound + positive answer to "do you have a minute?":
                 # speak the recording notice now, non-interruptible. It is
                 # appended to history only AFTER the reply (appending it here
                 # would leave history ending in "assistant", which Mistral
                 # rejects with HTTP 400).
                 notice_to_log = None
-                if is_outbound and not recording_disclosed and is_affirmative(user_text):
-                    recording_disclosed = True
+                if (
+                    is_outbound
+                    and not state["recording_disclosed"]
+                    and is_affirmative(user_text)
+                ):
+                    state["recording_disclosed"] = True
                     notice_to_log = _env_or("RELAY_RECORDING_DISCLOSURE", RECORDING_DISCLOSURE)
                     await websocket.send_json(
                         {
@@ -1307,10 +1438,10 @@ async def relay_ws(websocket: WebSocket) -> None:
                     "sure", "hi", "hello", "thanks", "thank",
                 }
                 bare_name_ok = False
-                if expecting_name:
-                    expecting_name = False
+                if state["expecting_name"]:
+                    state["expecting_name"] = False
                     bare_name_ok = 1 <= len(words) <= 2
-                elif callback_offered and not callback_name:
+                elif state["callback_offered"] and not state["callback_name"]:
                     bare_name_ok = len(words) == 1
                 if (
                     bare_name_ok
@@ -1318,17 +1449,17 @@ async def relay_ws(websocket: WebSocket) -> None:
                     and all(w.isalpha() for w in words)
                     and words[0].lower() not in fillers
                 ):
-                    callback_name = " ".join(
+                    state["callback_name"] = " ".join(
                         w.capitalize() for w in words[:2]
                     )
 
                 phone_newly_captured = False
                 phone = extract_phone(user_text)
                 if phone:
-                    if not callback_phone:
+                    if not state["callback_phone"]:
                         phone_newly_captured = True
-                    callback_phone = phone
-                    phone_buffer = ""
+                    state["callback_phone"] = phone
+                    state["phone_buffer"] = ""
                 else:
                     # Bank digit groups of 3+ across turns ("289." ...
                     # "901." ... "0990."). Groups under 3 digits ("3 pm",
@@ -1337,30 +1468,30 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # ("I pay 129") can't corrupt the real number.
                     for group in re.findall(r"\d+", user_text):
                         if len(group) >= 3:
-                            phone_buffer += group
-                    if len(phone_buffer) >= 10:
-                        if not callback_phone:
+                            state["phone_buffer"] += group
+                    if len(state["phone_buffer"]) >= 10:
+                        if not state["callback_phone"]:
                             phone_newly_captured = True
-                        callback_phone = "+1" + phone_buffer[-10:]
-                        phone_buffer = ""
+                        state["callback_phone"] = "+1" + state["phone_buffer"][-10:]
+                        state["phone_buffer"] = ""
                 name = extract_name(user_text)
                 if name:
-                    callback_name = name
+                    state["callback_name"] = name
 
                 # Log the callback as soon as both halves are known, instead
                 # of waiting for a later assistant reply that happens to
                 # contain the word "callback".
                 if (
-                    not callback_logged
-                    and callback_phone
-                    and callback_name
+                    not state["callback_logged"]
+                    and state["callback_phone"]
+                    and state["callback_name"]
                 ):
-                    callback_logged = True
+                    state["callback_logged"] = True
                     log_event(
                         "CALLBACK_REQUEST",
                         callSid=call_sid,
-                        name=callback_name,
-                        phone=callback_phone,
+                        name=state["callback_name"],
+                        phone=state["callback_phone"],
                     )
                     # If the store wants SMS alerts, text the callback
                     # details as they are captured. Env-gated: without
@@ -1370,7 +1501,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         asyncio.create_task(
                             send_sms(
                                 store_sms,
-                                f"Callback request: {callback_name} {callback_phone} (call {call_sid})",
+                                f"Callback request: {state['callback_name']} {state['callback_phone']} (call {call_sid})",
                             )
                         )
 
@@ -1394,6 +1525,11 @@ async def relay_ws(websocket: WebSocket) -> None:
                             ),
                         },
                     )
+
+                # Everything the caller has dictated this turn is now in
+                # `state`; persist it before the LLM call so a WebSocket drop
+                # mid-reply cannot lose a name or number.
+                save_call_state()
 
                 spoken_box[0] = ""
                 try:
@@ -1439,6 +1575,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                                     utteranceUntilInterrupt=utterance or None,
                                     heard_chars=len(heard),
                                 )
+                                # Acknowledge on the prompt that follows, not
+                                # now: the caller is still mid-sentence.
+                                interrupted = True
                                 reply = ""
                                 break
                             elif live.get("type") == "dtmf":
@@ -1522,7 +1661,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     # The next short reply is likely just the caller's name.
                     lowered_reply = reply.lower()
                     if "callback" in lowered_reply or "call you back" in lowered_reply:
-                        callback_offered = True
+                        state["callback_offered"] = True
                     if any(
                         phrase in lowered_reply
                         for phrase in (
@@ -1534,23 +1673,27 @@ async def relay_ws(websocket: WebSocket) -> None:
                             "can i have your name",
                         )
                     ):
-                        expecting_name = True
+                        state["expecting_name"] = True
                     # Backstop: the LLM often echoes the name itself
                     # ("Thank you Jonathan.") even when the caller's bare
                     # reply didn't match the name patterns. A capitalised
                     # word right after "thank you/thanks" is the name.
-                    if not callback_name:
+                    if not state["callback_name"]:
                         name_match = re.search(
                             r"(?i:thank you|thanks),?\s+([A-Z][a-z]+)", reply
                         )
                         if name_match:
                             candidate = name_match.group(1)
                             if candidate.lower() not in NAME_STOPWORDS:
-                                callback_name = candidate
+                                state["callback_name"] = candidate
+                    # The reply may have set the callback-offered / name-owed
+                    # flags; persist them for a reconnect.
+                    save_call_state()
 
             elif msg_type == "interrupt":
                 if llm_task is not None and not llm_task.done():
                     llm_task.cancel()
+                interrupted = True
                 log_event(
                     "interrupt",
                     callSid=call_sid,

@@ -219,6 +219,97 @@ def check_epp_offers_ws():
                 os.environ[k] = v
 
 
+async def check_idle_prompt():
+    """A caller who goes quiet mid-call must be prompted, not left in dead
+    air. Runs against the live server with its configured idle delay, so the
+    wait is cancellable and a regression fails the gate instead of hanging
+    it."""
+    idle_after = float(os.environ.get("RELAY_IDLE_AFTER", "8") or 0)
+    if idle_after <= 0:
+        print("IDLE PROMPT: skipped — RELAY_IDLE_AFTER=0 disables it")
+        return
+    idle_text = os.environ.get("RELAY_IDLE_TEXT") or "Are you still there?"
+    setup = dict(SETUP)
+    setup["callSid"] = "CAidle000000000000000000000000001"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        for _ in range(3):  # greeting, disclosure, question
+            await asyncio.wait_for(ws.recv(), timeout=10)
+        await ws.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "What are your hours?", "last": True}
+            )
+        )
+        await collect_until_last(ws)
+        # Now go quiet: the idle prompt must arrive on its own.
+        raw = await asyncio.wait_for(ws.recv(), timeout=idle_after + 8)
+        msg = json.loads(raw)
+        print("RECV (idle):", json.dumps(msg)[:200])
+        assert msg.get("type") == "text" and msg.get("last") is True, (
+            f"idle prompt must be a final text token: {msg}"
+        )
+        assert msg.get("token") == idle_text, (
+            f"unexpected idle prompt: {msg.get('token')!r}"
+        )
+        assert msg.get("interruptible") is True, (
+            f"idle prompt must be interruptible: {msg}"
+        )
+    print("IDLE PROMPT: pass — caller silence is answered, not left dead")
+
+
+async def check_reconnect_state():
+    """A dropped WebSocket must not lose the callback details the caller has
+    already dictated. They live in CALL_STATE, not in the conversation
+    history, so a reconnect has to restore them — otherwise the handoff
+    payload arrives at the store with no name and no number."""
+    sid = "CAtest0000000000000000000000000009"
+    setup = dict(SETUP)
+    setup["callSid"] = sid
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        for _ in range(3):  # greeting, disclosure, question
+            await asyncio.wait_for(ws.recv(), timeout=10)
+        await ws.send(json.dumps(PROMPT))
+        await collect_until_last(ws)
+    # Socket dropped mid-call. Twilio reconnects the same call.
+    setup_r = dict(setup)
+    setup_r["connectionType"] = "reconnect"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup_r))
+        # A reconnect must not re-speak the opening.
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            raise AssertionError(f"reconnect re-spoke the opening: {raw}")
+        except asyncio.TimeoutError:
+            pass
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Actually, let me talk to a representative.",
+                    "last": True,
+                }
+            )
+        )
+        end_msg = None
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                m = json.loads(raw)
+                if m.get("type") == "end":
+                    end_msg = m
+                    break
+        except asyncio.TimeoutError:
+            pass
+        assert end_msg is not None, "no end message after reconnect handoff"
+        hd = json.loads(end_msg.get("handoffData") or "{}")
+        cb = hd.get("callback") or {}
+        assert cb.get("name") == "Don" and cb.get("phone") == "+14165550100", (
+            f"reconnect lost the callback details: {hd}"
+        )
+    print("RECONNECT STATE: pass — callback details survive a dropped socket")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -322,7 +413,9 @@ async def main():
         )
         print("INTERRUPT PATH: pass — reply cancelled mid-stream, no last=true")
 
-        # Recovery: a fresh prompt after the interrupt must still get a reply.
+        # Recovery: a fresh prompt after the interrupt must still get a reply,
+        # and it must open with a short acknowledgement — the caller talked
+        # over the agent, so the agent yields the floor before answering.
         await ws.send(
             json.dumps(
                 {
@@ -333,6 +426,19 @@ async def main():
                 }
             )
         )
+        from server import interrupt_acks  # noqa: E402
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        print("RECV (post-interrupt ack):", json.dumps(ack)[:200])
+        assert ack.get("type") == "text" and ack.get("last") is True, (
+            f"expected an acknowledgement token after the interrupt: {ack}"
+        )
+        assert ack.get("interruptible") is True, (
+            f"acknowledgement must be interruptible: {ack}"
+        )
+        assert ack.get("token") in interrupt_acks(), (
+            f"unexpected acknowledgement: {ack.get('token')!r}"
+        )
+        print("INTERRUPT ACK: pass — acknowledgement spoken before the answer")
         received = await collect_until_last(ws)
         assert any(
             m.get("type") == "text" and m.get("last") is True for m in received
@@ -472,6 +578,8 @@ async def main():
     check_affirmative()
     check_repeat_guard()
     check_epp_offers_ws()
+    await check_idle_prompt()
+    await check_reconnect_state()
     print("\nALL TESTS PASSED")
 
 

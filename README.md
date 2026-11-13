@@ -89,9 +89,12 @@ curl -s http://localhost:8000/health
 | `RELAY_OUTBOUND_GREETING` | No | Greeting spoken on outbound setup. Default `OUTBOUND_GREETING`. |
 | `RELAY_DISCLOSURE` | No | Inbound AI + recording disclosure token. Default `DISCLOSURE`. |
 | `RELAY_RECORDING_DISCLOSURE` | No | Outbound recording notice (spoken after a positive answer to the greeting). Default `RECORDING_DISCLOSURE`. |
+| `RELAY_INTERRUPT_ACK` | No | Pipe-separated acknowledgements spoken when the caller talks over the agent, rotated per interruption. Default `INTERRUPT_ACKS` (`Sure.\|Go ahead.\|Of course.`). Set empty to disable. |
 | `RELAY_HINTS` | No | ConversationRelay STT `hints` attribute. Default `DEFAULT_HINTS`. |
 | `RELAY_NUDGE_AFTER` | No | Seconds of LLM silence before the silence nudge fires. Default `3`. |
 | `RELAY_NUDGE_TEXT` | No | Silence nudge text. Default `"One moment, ..."`. |
+| `RELAY_IDLE_AFTER` | No | Seconds of caller silence before the idle prompt fires, once the caller has spoken. Default `8`. `0` disables. |
+| `RELAY_IDLE_TEXT` | No | Idle prompt text. Default `"Are you still there?"`. |
 | `RELAY_STORE_NUMBER` | No | Store number dialed by `/handoff`. Default `+19052642228`. |
 | `RELAY_EPP_HARDWARE_OFFERS` | No | Verified Bell EPP hardware offers block appended to every system prompt (see "EPP offers blocks" below). Default empty = no block. |
 | `RELAY_EPP_PLAN_OFFERS` | No | Verified Bell EPP rate plan offers block, same mechanism. Default empty; set when the rate plan grid is loaded. |
@@ -218,8 +221,11 @@ the next request or redeploy — no code edit needed):
 | `RELAY_HINTS` | ConversationRelay `hints` attribute (both legs) | `DEFAULT_HINTS` |
 | `RELAY_DISCLOSURE` | inbound AI + recording disclosure token | `DISCLOSURE` |
 | `RELAY_RECORDING_DISCLOSURE` | outbound recording notice token | `RECORDING_DISCLOSURE` |
+| `RELAY_INTERRUPT_ACK` | acknowledgement spoken after the caller interrupts (pipe-separated, rotated) | `INTERRUPT_ACKS` |
 | `RELAY_NUDGE_AFTER` | silence-nudge delay (seconds) | `3` |
 | `RELAY_NUDGE_TEXT` | silence-nudge text | `"One moment, ..."` |
+| `RELAY_IDLE_AFTER` | caller-silence delay before the idle prompt (seconds, 0 = off) | `8` |
+| `RELAY_IDLE_TEXT` | idle prompt text | `"Are you still there?"` |
 | `RELAY_STORE_NUMBER` | `/handoff` dial target | `+19052642228` |
 | `RELAY_WS_URL` | public `wss://` URL written into `/twiml` | derived from request host |
 | `RELAY_LANGUAGE` | STT/TTS language | `en-CA` |
