@@ -690,6 +690,9 @@ MOCK_REPLIES = {
     "askname": "Sure — what's your first name?",
     "sttname": "Sorry, what's your first name?",
     "gotnumber": "Got it, 416-000-1111. What's your first name?",
+    # A bare sign-off, so the closing exemption in the repeat guard can be
+    # exercised end-to-end. Only reachable in MOCK_LLM mode.
+    "bye": "Goodbye.",
 }
 
 
@@ -733,6 +736,8 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["sttname"]
     if "4160001111" in lowered:
         return MOCK_REPLIES["gotnumber"]
+    if "byeref" in lowered:
+        return MOCK_REPLIES["bye"]
     if "pitchref" in lowered:
         swapped = any(
             m.get("role") == "system"
@@ -1742,7 +1747,15 @@ async def relay_ws(websocket: WebSocket) -> None:
                 # the caller asks what the call is about, so the same sentence
                 # twice is expected. A pitch-like repeat is still replaced —
                 # that is the loop this guard was built for.
-                if _caller_asked(user_text) and not _pitch_delivered(gate):
+                if CLOSING_RE.search(gate):
+                    # A sign-off is not content the caller has to hear only
+                    # once. A live call (CA2e04) said "Goodbye." and then
+                    # answered "Sorry, I didn't catch that" four times while
+                    # the caller tried to hang up.
+                    log_event(
+                        "repeat_allowed_closing", callSid=call_sid, text=gate.strip()
+                    )
+                elif _caller_asked(user_text) and not _pitch_delivered(gate):
                     log_event(
                         "repeat_allowed_answer", callSid=call_sid, text=gate.strip()
                     )
@@ -2359,7 +2372,8 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # is the fix; another negative rule is not.
                         _swap_to_after_pitch(history, state, call_sid)
                     if is_repeat(prev_assistant, reply.strip()) and not (
-                        _caller_asked(user_text) and not _pitch_delivered(reply)
+                        CLOSING_RE.search(reply)
+                        or (_caller_asked(user_text) and not _pitch_delivered(reply))
                     ):
                         # History-level backstop only: the caller has already
                         # heard this reply, so this keeps the model from

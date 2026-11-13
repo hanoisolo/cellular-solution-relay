@@ -1653,6 +1653,49 @@ async def check_callback_done_note_ws():
     print("CALLBACK DONE NOTE: pass — a booked callback is not offered again")
 
 
+async def check_closing_repeat_ws():
+    """End-to-end: a repeated sign-off must be spoken, not replaced.
+
+    A live call (CA2e04) said "Goodbye." and then answered the caller's next
+    "Goodbye." with "Sorry, I didn't catch that" — four times in a row, while
+    the caller was trying to hang up. A sign-off is not content the caller has
+    to hear only once, so the repeat guard must let it through.
+    """
+    from server import MOCK_REPLIES, REPEAT_FALLBACKS  # noqa: E402
+
+    async def _spoken(ws):
+        tokens = []
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            m = json.loads(raw)
+            if m.get("type") != "text" or m.get("interruptible") is False:
+                continue
+            tokens.append(m.get("token") or "")
+            if m.get("last") is True:
+                break
+        return "".join(tokens).strip()
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000027"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        for _ in range(3):
+            await ws.send(
+                json.dumps(
+                    {"type": "prompt", "voicePrompt": "byeref", "last": True}
+                )
+            )
+            spoken = await _spoken(ws)
+            assert spoken == MOCK_REPLIES["bye"], (
+                f"a repeated sign-off was replaced: {spoken!r}"
+            )
+            assert spoken not in REPEAT_FALLBACKS, spoken
+    print("CLOSING REPEAT: pass — a sign-off is never replaced")
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -2109,6 +2152,7 @@ async def main():
     await check_name_reask_ws()
     await check_name_escape_hatch_ws()
     await check_callback_done_note_ws()
+    await check_closing_repeat_ws()
     print("\nALL TESTS PASSED")
 
 
