@@ -99,12 +99,110 @@ def check_affirmative():
 
 def check_repeat_guard():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from server import is_repeat
+    from server import is_repeat, REPEAT_FALLBACKS, OUTBOUND_SYSTEM_PROMPT, SYSTEM_PROMPT
 
     assert is_repeat("Do you have a minute?", "Do you have a minute?")
     assert is_repeat("Do you  have a minute?", "do you have a minute?")
     assert not is_repeat("Do you have a minute?", "Sure, go ahead.")
     assert not is_repeat("", "anything")
+
+    # Near-duplicates. These are the four pitches a live call
+    # (CA106db13e99260b9376d66230bb1c2c3c) spoke back to back. Only the
+    # opening words changed, so exact matching let the loop run to the end of
+    # the call.
+    pitch_a = (
+        "Bell's Employee Purchase Program, or EPP, gives employees of select "
+        "partner companies up to 30 percent off Bell mobility plans and waives "
+        "activation fees. To check if your company is eligible, visit cellular "
+        "solution dot c a, click Employee Offers, and type in your company "
+        "name. If your company comes up, you're eligible. Proof of employment "
+        "is shown after ordering. Would you like me to check your eligibility "
+        "on the website, or should I arrange a callback from the store so they "
+        "can confirm it for you?"
+    )
+    pitch_b = (
+        "Great. EPP gives employees of select partner companies up to 30 "
+        "percent off Bell mobility plans and waives activation fees. To check "
+        "if your company is eligible, visit cellular solution dot c a, click "
+        "Employee Offers, and type in your company name. If your company comes "
+        "up, you're eligible. Proof of employment is shown after ordering. "
+        "Would you like me to check your eligibility on the website, or should "
+        "I arrange a callback from the store so they can confirm it for you?"
+    )
+    pitch_c = (
+        "EPP gives employees of select partner companies up to 30 percent off "
+        "Bell mobility plans and waives activation fees. To check if your "
+        "company is eligible, visit cellular solution dot c a, click Employee "
+        "Offers, and type in your company name. If your company comes up, "
+        "you're eligible. Would you like me to check your eligibility on the "
+        "website, or should I arrange a callback from the store so they can "
+        "confirm it for you?"
+    )
+    pitch_d = (
+        "Bell's Employee Purchase Program, or EPP, gives employees of select "
+        "partner companies up to 30 percent off Bell mobility plans and waives "
+        "activation fees. To check if your company is eligible, visit cellular "
+        "solution dot c a, click Employee Offers, and type in your company "
+        "name. If your company comes up, you're eligible. Would you like me to "
+        "check your eligibility on the website, or should I arrange a callback "
+        "from the store so they can confirm it for you?"
+    )
+    for prev, cur, label in (
+        (pitch_a, pitch_b, "a->b"),
+        (pitch_b, pitch_c, "b->c"),
+        (pitch_c, pitch_d, "c->d"),
+        (pitch_a, pitch_d, "a->d"),
+    ):
+        assert is_repeat(prev, cur), (
+            f"near-duplicate pitch not caught ({label}): the model would loop"
+        )
+
+    # Legitimate consecutive replies must never be flagged: a false positive
+    # makes the assistant say "sorry, I didn't catch that" to a caller it
+    # understood perfectly.
+    for cur, label in (
+        ("Would you like the store to call you back with the details?", "callback offer"),
+        ("Great, and what is your name?", "name ask"),
+        (
+            "The iPhone 17 256GB on SmartPay Ultra is 62 dollars 91 a month "
+            "with tax. Would you like the store to confirm the other sizes?",
+            "price answer",
+        ),
+        (
+            "The store is open Monday to Friday, 9am to 5pm. Would you like me "
+            "to arrange a callback?",
+            "store hours",
+        ),
+        (
+            "You can check at cellular solution dot c a, click Employee "
+            "Offers, and type in your company name. Would you like the store "
+            "to call you back?",
+            "website directions",
+        ),
+        (
+            "No problem at all. If you change your mind, the store is at "
+            "905-264-2228. Have a good day.",
+            "decline",
+        ),
+    ):
+        assert not is_repeat(pitch_c, cur), (
+            f"legitimate reply flagged as a repeat ({label}): {cur!r}"
+        )
+    assert not is_repeat("Sure.", "Go ahead."), "short acks flagged as a repeat"
+
+    # The guard must not answer a loop with a loop of its own.
+    assert len(REPEAT_FALLBACKS) == 2, REPEAT_FALLBACKS
+    assert REPEAT_FALLBACKS[0] != REPEAT_FALLBACKS[1], REPEAT_FALLBACKS
+
+    # The prompt has to stop the loop at the source too: the guard only
+    # rewrites a reply after the model has already produced it.
+    assert "Give the pitch ONCE" in OUTBOUND_SYSTEM_PROMPT, (
+        "outbound prompt lost the say-the-pitch-once rule"
+    )
+    for name, prompt in (("outbound", OUTBOUND_SYSTEM_PROMPT), ("inbound", SYSTEM_PROMPT)):
+        assert "Never repeat a previous reply" in prompt, (
+            f"{name} prompt lost the never-repeat-a-reply rule"
+        )
     print("REPEAT GUARD CHECKS: pass")
 
 

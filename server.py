@@ -19,6 +19,7 @@ written to a file or a log by this server.
 
 import asyncio
 import base64
+import difflib
 import hashlib
 import hmac
 import json
@@ -166,10 +167,46 @@ def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+# Near-duplicate repeat detection. Replies shorter than REPEAT_MIN_CHARS are
+# compared exactly only, so ordinary short answers are never flagged. A long
+# reply counts as a repeat when it is either mostly the same text
+# (REPEAT_SIMILARITY) or shares a long verbatim block (REPEAT_MIN_BLOCK) —
+# the model rewords the opening of the pitch but keeps the body word for
+# word, which the ratio alone misses.
+REPEAT_MIN_CHARS = 80
+REPEAT_SIMILARITY = 0.85
+REPEAT_MIN_BLOCK = 150
+
+# Spoken in place of a reply the model looped. Two variants, so the guard
+# never answers a loop with a loop of its own.
+REPEAT_FALLBACKS = (
+    "Sorry, I didn't catch that — could you say it again?",
+    "I'm having trouble hearing you. Could you say that once more?",
+)
+
+
 def is_repeat(prev: str, cur: str) -> bool:
-    """True when the new reply is a verbatim repeat of the previous one —
-    backstop against the model looping the same sentence on a call."""
-    return bool(_norm_text(prev)) and _norm_text(prev) == _norm_text(cur)
+    """True when the new reply repeats the previous one — verbatim, or, for
+    long replies, near-verbatim. Backstop against the model looping the same
+    pitch on a call.
+
+    A live call showed the model re-emitting the EPP pitch four times with
+    only the opening words reworded ("Great. EPP gives..." / "Bell's Employee
+    Purchase Program, or EPP, gives..."), so exact matching was not enough.
+    Short replies are compared exactly only: "Sure." and "Go ahead." are
+    legitimate consecutive answers, not a loop.
+    """
+    p, c = _norm_text(prev), _norm_text(cur)
+    if not p or not c:
+        return False
+    if p == c:
+        return True
+    if len(p) < REPEAT_MIN_CHARS or len(c) < REPEAT_MIN_CHARS:
+        return False
+    matcher = difflib.SequenceMatcher(None, p, c)
+    if matcher.ratio() >= REPEAT_SIMILARITY:
+        return True
+    return matcher.find_longest_match(0, len(p), 0, len(c)).size >= REPEAT_MIN_BLOCK
 
 OUTBOUND_SYSTEM_PROMPT = (
     "You are Cellular Solution's automated voice assistant, a Bell authorized "
@@ -187,6 +224,11 @@ OUTBOUND_SYSTEM_PROMPT = (
     "first. If the person's first reply is unclear, garbled, or just a "
     "greeting like 'hello', do NOT ask the minute question again — the "
     "greeting already asked it. Go straight into the pitch. "
+    "Give the pitch ONCE. After you have given it, never give it again, "
+    "not even reworded: if the person is still unclear, repeats a "
+    "greeting, or says they are listening, ask one specific question "
+    "instead — for example whether they would like the store to call "
+    "them back. "
     "EPP is for employees of "
     "select partner companies — NOT only Bell employees. Never say someone "
     "has to work for Bell, and never ask if they are a Bell employee. To "
@@ -201,8 +243,9 @@ OUTBOUND_SYSTEM_PROMPT = (
     "a store callback. "
     "Pronunciation: always say the website as 'cellular solution dot c a' — "
     "two words, cellular and solution. Never say 'w w w' or 'triple w'. "
-    "Do not repeat the website directions in every reply. Say them once "
-    "when the topic first comes up; after that, just offer the callback. "
+    "Never repeat a previous reply, in whole or in part. Say the website "
+    "directions once when the topic first comes up; after that, just "
+    "offer the callback. "
     "Your job is to qualify interest in Bell mobility and EPP. "
     "Answer basic questions about EPP. NEVER invent or promise a specific "
     "price, plan detail, phone model price, or eligibility answer you cannot "
@@ -254,8 +297,9 @@ SYSTEM_PROMPT = (
     "a store callback. "
     "Pronunciation: always say the website as 'cellular solution dot c a' — "
     "two words, cellular and solution. Never say 'w w w' or 'triple w'. "
-    "Do not repeat the website directions in every reply. Say them once "
-    "when the topic first comes up; after that, just offer the callback. "
+    "Never repeat a previous reply, in whole or in part. Say the website "
+    "directions once when the topic first comes up; after that, just "
+    "offer the callback. "
     "Answer basic questions about EPP. NEVER invent or promise a specific "
     "price, plan detail, phone model price, or eligibility answer you cannot "
     "verify. If you do not know, say the store will confirm it. "
@@ -1650,10 +1694,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # offer, which on a live call derailed the name
                         # capture ("I'm listening." -> "would you like the
                         # store to call you back?").
-                        reply = (
-                            "Sorry, I didn't catch that — could you say it "
-                            "again?"
-                        )
+                        reply = REPEAT_FALLBACKS[0]
+                        if _norm_text(prev_assistant) == _norm_text(reply):
+                            reply = REPEAT_FALLBACKS[1]
                     log_event(
                         "turn_done",
                         callSid=call_sid,
