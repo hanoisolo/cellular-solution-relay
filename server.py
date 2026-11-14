@@ -883,6 +883,11 @@ def _invented_price_at(spoken: str, pending: str) -> int | None:
         whole = m.group(1) or m.group(3)
         if not whole:
             continue
+        if m.end() >= len(window):
+            # The figure is still arriving: the model has streamed "$4" of
+            # "$49.44". Reading it as $4.00 killed a legitimate grid quote on
+            # CA62a03b, so wait for the rest of the number.
+            return None
         cents = m.group(2) or m.group(4) or m.group(5) or "0"
         try:
             amount = f"{float(whole) + float(cents) / 100:.2f}"

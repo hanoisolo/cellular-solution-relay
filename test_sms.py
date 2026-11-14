@@ -722,6 +722,17 @@ def main():
           server._gate_commits(
               "The cheapest plans start at about $35 a month.") is False,
           "committed")
+    # A figure still arriving must not be read as a smaller number. On
+    # CA62a03b the model streamed "the Samsung Galaxy S26 FE 128GB starts at
+    # $4" of "$49.44" and the guard killed a legitimate grid quote.
+    check("_invented_price_at waits for a figure still arriving",
+          server._invented_price_at(
+              "", "The Samsung Galaxy S26 FE 128GB starts at $4") is None,
+          "fired on a partial figure")
+    check("_invented_price_at fires on a complete invented figure",
+          server._invented_price_at(
+              "", "The cheapest plans start at about $35 a month.") == 0,
+          "did not fire")
     check("_gate_commits lets the price fallback through",
           server._gate_commits(server.PRICE_FALLBACKS[0]) is True, "held")
     for fallback in server.PRICE_FALLBACKS:
