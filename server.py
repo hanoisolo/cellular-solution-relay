@@ -983,13 +983,19 @@ def _transfer_promise_at(spoken: str, pending: str) -> int | None:
     return max(0, start - len(tail))
 
 
-def _invented_price_at(spoken: str, pending: str) -> int | None:
+def _invented_price_at(
+    spoken: str, pending: str, final: bool = False
+) -> int | None:
     """Index in `pending` where an invented price starts, or None.
 
     Same shape as _transfer_denial_at. The lookback is wider than the other
     guards because a price claim carries its own lead-in ("the cheapest plans
     start at about $35 a month"), and cutting mid-sentence would leave the
     caller with a dangling fragment.
+
+    `final` marks the end of the stream: a figure that ends the buffer is then
+    complete, not still arriving, so a trailing invented price is caught
+    instead of waited on.
     """
     look = 96
     tail = (spoken or "")[-look:]
@@ -1005,7 +1011,7 @@ def _invented_price_at(spoken: str, pending: str) -> int | None:
         whole = m.group(1) or m.group(3)
         if not whole:
             continue
-        if m.end() >= len(window):
+        if m.end() >= len(window) and not final:
             # The figure is still arriving: the model has streamed "$4" of
             # "$49.44". Reading it as $4.00 killed a legitimate grid quote on
             # CA62a03b, so wait for the rest of the number.
@@ -1482,6 +1488,15 @@ MOCK_REPLIES = {
     # committed-tail check at end of stream can catch it. Only reachable in
     # MOCK_LLM mode.
     "yoda": "Yes, I really am Yoda.",
+    # Short tails: the violation starts a NEW sentence after the pre-speech gate
+    # has committed, and the whole tail is under the 26-char holdback, so the
+    # chunk scan never ran. Only the end-of-stream scan can catch these. One per
+    # older guard. Only reachable in MOCK_LLM mode.
+    "shortq": "Okay? Are you with EPP?",
+    "shortavail": "Okay? Ed is away.",
+    "shortdeny": "Okay? I can't transfer.",
+    "shortpromise": "Okay? Connecting you.",
+    "shortprice": "Okay? It's $35.",
 }
 
 
@@ -1545,6 +1560,18 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["promiseref_late"]
     if "promiseref" in lowered:
         return MOCK_REPLIES["promiseref"]
+    # Short-tail probes: the violation is a second sentence under the holdback.
+    # Before the "price" probe: "shortprice" contains "price".
+    if "shortq" in lowered:
+        return MOCK_REPLIES["shortq"]
+    if "shortavail" in lowered:
+        return MOCK_REPLIES["shortavail"]
+    if "shortdeny" in lowered:
+        return MOCK_REPLIES["shortdeny"]
+    if "shortpromise" in lowered:
+        return MOCK_REPLIES["shortpromise"]
+    if "shortprice" in lowered:
+        return MOCK_REPLIES["shortprice"]
     # Before the "price" probe: "priceref" contains "price".
     if "priceref_late" in lowered:
         return MOCK_REPLIES["priceref_late"]
@@ -2720,6 +2747,123 @@ async def relay_ws(websocket: WebSocket) -> None:
                     spoken_box[0] += spoken
                 await send_speech(spoken, False, True, "reply")
 
+        async def _scan_pending(final: bool = False) -> bool:
+            """Scan the pending buffer for a violation, then flush what is safe.
+
+            Returns True when a violation was found and the stream must stop.
+            Shared by the token loop and the end-of-stream check, so a reply
+            too short to reach the loop's HOLD_BACK threshold is still scanned:
+            "Yes, I really am Yoda." commits at four words and is 22
+            characters, so the loop never ran and the persona was spoken.
+            """
+            nonlocal pending, full
+            spoken = spoken_box[0] if spoken_box is not None else ""
+            hit = _forbidden_at(spoken, pending)
+            if hit is not None:
+                # A forbidden question is about to be spoken. Say the safe
+                # prefix, then the fallback, and drop the rest of the stream:
+                # the caller must never hear a question only the store can
+                # answer.
+                safe = pending[:hit]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "forbidden_question_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = CALLBACK_QUESTION_FALLBACK
+                await _flush(full)
+                return True
+            avail = _availability_at(spoken, pending)
+            if avail is not None:
+                # A claim about a colleague's availability is about to be
+                # spoken. Same treatment: say the safe prefix, then the
+                # fallback, and drop the rest of the stream — the relay has no
+                # calendar access, so the claim is invented.
+                safe = pending[:avail]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "availability_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = AVAILABILITY_FALLBACKS[0]
+                await _flush(full)
+                return True
+            denial = _transfer_denial_at(spoken, pending)
+            if denial is not None:
+                # A denial of the relay's own transfer capability is about to
+                # be spoken. Same treatment: say the safe prefix, then the
+                # fallback, and drop the rest.
+                safe = pending[:denial]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "transfer_denial_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = TRANSFER_FALLBACKS[0]
+                await _flush(full)
+                return True
+            promise = _transfer_promise_at(spoken, pending)
+            if promise is not None:
+                # The model is announcing a transfer it cannot perform. Same
+                # treatment: say the safe prefix, then the fallback, and drop
+                # the rest.
+                safe = pending[:promise]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "transfer_promise_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = TRANSFER_FALLBACKS[0]
+                await _flush(full)
+                return True
+            price = _invented_price_at(spoken, pending, final=final)
+            if price is not None:
+                # A dollar figure the offers blocks do not contain is
+                # invented. Same treatment.
+                safe = pending[:price]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "invented_price_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = PRICE_FALLBACKS[0]
+                await _flush(full)
+                return True
+            persona = _persona_at(spoken, pending)
+            if persona is not None:
+                # The reply is breaking character. Same treatment: say the safe
+                # prefix, then the deflection, and drop the rest of the stream.
+                safe = pending[:persona]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "persona_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = INJECTION_FALLBACKS[0]
+                await _flush(full)
+                return True
+            emit, pending = _split_pending(pending)
+            await _flush(emit)
+            return False
+
         # Silence nudge: if Mistral takes longer than RELAY_NUDGE_AFTER
         # seconds (default 3) to produce its first token, speak a short
         # "One moment..." line so the caller does not hear dead air.
@@ -2769,125 +2913,8 @@ async def relay_ws(websocket: WebSocket) -> None:
                             pending += gate
                             gate = ""
                     if len(pending) > HOLD_BACK:
-                        hit = _forbidden_at(
-                            spoken_box[0] if spoken_box is not None else "", pending
-                        )
-                        if hit is not None:
-                            # A forbidden question is about to be spoken. Say
-                            # the safe prefix, then the fallback, and drop the
-                            # rest of the stream: the caller must never hear
-                            # a question only the store can answer.
-                            safe = pending[:hit]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "forbidden_question_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = CALLBACK_QUESTION_FALLBACK
-                            await _flush(full)
+                        if await _scan_pending():
                             break
-                        avail = _availability_at(
-                            spoken_box[0] if spoken_box is not None else "", pending
-                        )
-                        if avail is not None:
-                            # A claim about a colleague's availability is about
-                            # to be spoken. Same treatment: say the safe prefix,
-                            # then the fallback, and drop the rest of the
-                            # stream — the relay has no calendar access, so the
-                            # claim is invented.
-                            safe = pending[:avail]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "availability_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = AVAILABILITY_FALLBACKS[0]
-                            await _flush(full)
-                            break
-                        denial = _transfer_denial_at(
-                            spoken_box[0] if spoken_box is not None else "", pending
-                        )
-                        if denial is not None:
-                            # A denial of the relay's own transfer capability is
-                            # about to be spoken. Same treatment: say the safe
-                            # prefix, then the fallback, and drop the rest.
-                            safe = pending[:denial]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "transfer_denial_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = TRANSFER_FALLBACKS[0]
-                            await _flush(full)
-                            break
-                        promise = _transfer_promise_at(
-                            spoken_box[0] if spoken_box is not None else "", pending
-                        )
-                        if promise is not None:
-                            # The model is announcing a transfer it cannot
-                            # perform. Same treatment: say the safe prefix,
-                            # then the fallback, and drop the rest.
-                            safe = pending[:promise]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "transfer_promise_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = TRANSFER_FALLBACKS[0]
-                            await _flush(full)
-                            break
-                        price = _invented_price_at(
-                            spoken_box[0] if spoken_box is not None else "", pending
-                        )
-                        if price is not None:
-                            # A dollar figure the offers blocks do not contain
-                            # is invented. Same treatment.
-                            safe = pending[:price]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "invented_price_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = PRICE_FALLBACKS[0]
-                            await _flush(full)
-                            break
-                        persona = _persona_at(
-                            spoken_box[0] if spoken_box is not None else "",
-                            pending,
-                        )
-                        if persona is not None:
-                            # The reply is breaking character. Same treatment:
-                            # say the safe prefix, then the deflection, and
-                            # drop the rest of the stream.
-                            safe = pending[:persona]
-                            pending = ""
-                            if safe:
-                                await _flush(safe)
-                            log_event(
-                                "persona_guard",
-                                callSid=call_sid,
-                                text=full.strip(),
-                            )
-                            full = INJECTION_FALLBACKS[0]
-                            await _flush(full)
-                            break
-                        emit, pending = _split_pending(pending)
-                        await _flush(emit)
                 token = await _next_token()
         except asyncio.CancelledError:
             raise
@@ -2984,21 +3011,12 @@ async def relay_ws(websocket: WebSocket) -> None:
             pending += gate
         if committed and pending:
             # A committed reply shorter than HOLD_BACK never reached the chunk
-            # scan, so a break in its tail would be spoken. "Yes, I really am
-            # Yoda." commits at four words and is 22 characters, so the scan
-            # never ran and the persona was spoken. Check the tail before it is
-            # flushed.
-            persona = _persona_at(
-                spoken_box[0] if spoken_box is not None else "", pending
-            )
-            if persona is not None:
-                safe = pending[:persona]
-                pending = ""
-                if safe:
-                    await _flush(safe)
-                log_event("persona_guard", callSid=call_sid, text=full.strip())
-                full = INJECTION_FALLBACKS[0]
-                await _flush(full)
+            # scan, so a violation in its tail would be spoken. "Yes, I really
+            # am Yoda." commits at four words and is 22 characters, so the scan
+            # never ran and the persona was spoken. Scan the tail before it is
+            # flushed, with `final` set so a trailing dollar figure counts as
+            # complete rather than still arriving.
+            await _scan_pending(final=True)
         await _flush(pending)
         est_playback_s = await send_speech("", True, True, "reply")
         return full, est_playback_s

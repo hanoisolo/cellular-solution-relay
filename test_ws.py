@@ -2668,6 +2668,59 @@ async def check_persona_break_guard_ws():
     print("PERSONA BREAK GUARD WS: pass — a break is replaced before it is spoken")
 
 
+async def check_short_tail_guard_ws():
+    """End-to-end: a violation that arrives as a SHORT second sentence is still
+    caught.
+
+    The pre-speech gate commits a reply at its first question mark or after
+    three words, so "Okay?" is spoken and the rest is pending. The chunk scan
+    only ran once the pending buffer passed the 26-char holdback, so a tail
+    shorter than that was flushed unscanned — the violation reached the
+    caller. The end-of-stream scan now covers it for every guard.
+    """
+    from server import (  # noqa: E402
+        AVAILABILITY_FALLBACKS,
+        CALLBACK_QUESTION_FALLBACK,
+        PRICE_FALLBACKS,
+        TRANSFER_FALLBACKS,
+    )
+
+    cases = (
+        ("shortq", (CALLBACK_QUESTION_FALLBACK,), ("are you with",)),
+        ("shortavail", AVAILABILITY_FALLBACKS, ("away",)),
+        ("shortdeny", TRANSFER_FALLBACKS, ("can't transfer",)),
+        ("shortpromise", TRANSFER_FALLBACKS, ("connecting you",)),
+        ("shortprice", PRICE_FALLBACKS, ("$35",)),
+    )
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000035"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        for trigger, fallbacks, forbidden in cases:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "prompt",
+                        "voicePrompt": f"Tell me about {trigger}",
+                        "last": True,
+                    }
+                )
+            )
+            spoken = await _collect_reply(ws)
+            assert any(f in spoken for f in fallbacks), (
+                f"a short-tail violation ({trigger}) was not replaced: {spoken!r}"
+            )
+            for word in forbidden:
+                assert word not in spoken.lower(), (
+                    f"the short-tail violation ({trigger}) was spoken: {spoken!r}"
+                )
+    print(
+        "SHORT TAIL GUARD WS: pass — a violation under the holdback is replaced"
+    )
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -3134,6 +3187,7 @@ async def main():
     await check_fragment_prompt_ws()
     await check_injection_guard_ws()
     await check_persona_break_guard_ws()
+    await check_short_tail_guard_ws()
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()

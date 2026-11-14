@@ -733,6 +733,15 @@ def main():
           server._invented_price_at(
               "", "The cheapest plans start at about $35 a month.") == 0,
           "did not fire")
+    # The end-of-stream scan marks the buffer final, so a figure that ends it is
+    # complete rather than still arriving. Without that, a trailing invented
+    # price was waited on forever and spoken.
+    check("_invented_price_at waits for a figure still arriving mid-stream",
+          server._invented_price_at("", "$35") is None,
+          "a partial figure was read as complete mid-stream")
+    check("_invented_price_at fires on a trailing figure at end of stream",
+          server._invented_price_at("", "$35", final=True) == 0,
+          "a trailing invented figure was not caught at end of stream")
     check("_gate_commits lets the price fallback through",
           server._gate_commits(server.PRICE_FALLBACKS[0]) is True, "held")
     for fallback in server.PRICE_FALLBACKS:
