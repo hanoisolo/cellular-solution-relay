@@ -2834,6 +2834,124 @@ async def check_smartpay_terms_guard_ws():
     )
 
 
+async def check_price_deflect_guard_ws():
+    """End-to-end: a price question that named no device is answered with the
+    device question, not a deflection.
+
+    On CA68caad the caller said "Take on an extra, uh, what's the price for
+    the, um," and got "The store will confirm the exact price for you" — a
+    deflection, when the useful next step was to ask which phone. It cost
+    three turns to reach a price.
+    """
+    from server import DEVICE_QUESTION  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000038"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Take on an extra, uh, what's the price for "
+                    "the, um, deflectref",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert DEVICE_QUESTION in spoken, (
+            f"the deflection was not replaced with the device question: {spoken!r}"
+        )
+        assert "store will confirm" not in spoken.lower(), (
+            f"the deflection was spoken: {spoken!r}"
+        )
+        # The gate commits at four words, so a reply that opens with something
+        # else commits before the deflection arrives. Only the chunk scan can
+        # catch that.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "what's the price for the, um, deflectref_late",
+                    "last": True,
+                }
+            )
+        )
+        late = await _collect_reply(ws)
+        assert DEVICE_QUESTION in late, (
+            f"the late deflection was not replaced: {late!r}"
+        )
+        assert "store will confirm" not in late.lower(), (
+            f"the late deflection was spoken: {late!r}"
+        )
+    print(
+        "PRICE DEFLECT GUARD WS: pass — a device-less price question asks which phone"
+    )
+
+
+async def check_list_ask_guard_ws():
+    """End-to-end: a caller who asked to see everything in a line is not asked
+    to narrow it down.
+
+    On CA68caad the caller said "All the iPhones." and got "Which iPhone model
+    and storage size are you looking at?" — a narrowing question that ignores
+    the word "all".
+
+    The replacement text is pinned in test_sms.py, not here: the mock server
+    runs without RELAY_EPP_HARDWARE_OFFERS, so list_reply() returns None and
+    the guard falls back to the generic recovery. What this check proves is the
+    wiring — the narrowing question is never spoken and the caller gets an open
+    turn instead.
+    """
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000039"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "All the iPhones narrowref",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert "which iphone model" not in spoken.lower(), (
+            f"the narrowing question was spoken: {spoken!r}"
+        )
+        assert spoken.strip().endswith("?"), (
+            f"the replacement is not an open turn: {spoken!r}"
+        )
+        # The gate commits at four words, so "I can help with that. Which
+        # iPhone model..." commits before the narrowing question arrives.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "All the iPhones narrowref_late",
+                    "last": True,
+                }
+            )
+        )
+        late = await _collect_reply(ws)
+        assert "which iphone model" not in late.lower(), (
+            f"the late narrowing question was spoken: {late!r}"
+        )
+        assert late.strip().endswith("?"), (
+            f"the late replacement is not an open turn: {late!r}"
+        )
+    print(
+        "LIST ASK GUARD WS: pass — 'all the iPhones' is not answered with a "
+        "narrowing question"
+    )
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -3303,6 +3421,8 @@ async def main():
     await check_short_tail_guard_ws()
     await check_website_repeat_guard_ws()
     await check_smartpay_terms_guard_ws()
+    await check_price_deflect_guard_ws()
+    await check_list_ask_guard_ws()
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()

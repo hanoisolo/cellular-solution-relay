@@ -524,6 +524,14 @@ def _gate_commits(
     # Website directions the caller has already heard are not repeated.
     if repeats_website(t, website_spoken, user_text):
         return False
+    # A price question that named no device must be answered with the device
+    # question, not a deflection, so hold the deflection from its first words.
+    if deflects_price_question(t, user_text):
+        return False
+    # A caller who asked to see everything in a line must not be answered with
+    # a narrowing question, so hold that too.
+    if LIST_ASK_RE.search(user_text or "") and NARROW_RE.search(t):
+        return False
     # A price-ish reply is held until its first sentence completes, so an
     # invented figure can be replaced with the whole sentence rather than
     # leaving a dangling lead-in already spoken.
@@ -805,9 +813,177 @@ def claims_smartpay_terms(reply: str) -> bool:
     return bool(SMARTPAY_TERMS_RE.search(t))
 
 
+# A caller asking for a price without naming a device. On CA68caad the caller
+# said "what's the price for the, um," and got "The store will confirm the
+# exact price for you" — a deflection, when the useful next step was to ask
+# which phone. The deflection is replaced with the device question, but only
+# when the caller named no device AND the reply names none either: a reply that
+# says "the iPhone 18 Pro 2TB isn't in my list, the store will confirm" is
+# answering a real question and must be left alone.
+PRICE_ASK_RE = re.compile(
+    r"\b(?:price|prices|pricing|cost|costs|how much|expensive|cheapest)\b",
+    re.IGNORECASE,
+)
+DEVICE_NAMED_RE = re.compile(
+    r"\b(?:iphone|pixel|galaxy|samsung|apple|google|motorola|moto|ahlo"
+    r"|pro max|pro|max|plus|ultra|fold|flip|air|duo|fe|gb|tb)\b",
+    re.IGNORECASE,
+)
+PLAN_ASK_RE = re.compile(
+    r"\b(?:plan|plans|rate|rates|monthly|per month|a month)\b", re.IGNORECASE
+)
+PRICE_DEFLECT_RE = re.compile(
+    r"\b(?:store (?:will|can) confirm|confirm the exact price"
+    r"|don'?t have (?:live )?pricing|not able to quote|can'?t quote)\b",
+    re.IGNORECASE,
+)
+DEVICE_QUESTION = "Which phone are you asking about?"
+
+
+def deflects_price_question(reply: str, user_text: str = "") -> bool:
+    """True when a price question that named no device was answered with a
+    deflection instead of a device question."""
+    asked = user_text or ""
+    if not PRICE_ASK_RE.search(asked):
+        return False
+    if DEVICE_NAMED_RE.search(asked) or PLAN_ASK_RE.search(asked):
+        return False
+    t = reply or ""
+    if DEVICE_NAMED_RE.search(t):
+        return False
+    return bool(PRICE_DEFLECT_RE.search(t))
+
+
+# A caller asking to see everything in a line ("all the iPhones", "what phones
+# do you have"). On CA68caad the caller said "All the iPhones." and got "Which
+# iPhone model and storage size are you looking at?" — a narrowing question
+# that ignores the word "all". The relay answers it from the offers block.
+LIST_ASK_RE = re.compile(
+    r"\b(?:all (?:the |of the )?(?:iphones?|pixels?|galax(?:y|ies)|samsungs?"
+    r"|phones?|devices?|models?|handsets?)"
+    r"|every (?:iphone|pixel|galaxy|samsung|phone|device|model)"
+    r"|what (?:iphones|pixels|galaxies|samsungs|phones|devices|models)"
+    r" (?:do you|have you|are)"
+    r"|which (?:iphones|pixels|galaxies|samsungs|phones|devices|models)"
+    r" (?:do you|have you|are)"
+    r"|list (?:the |of )?(?:iphones|pixels|galaxies|samsungs|phones|devices"
+    r"|models))\b",
+    re.IGNORECASE,
+)
+
+# A reply that only narrows the question instead of answering it.
+NARROW_RE = re.compile(
+    r"\bwhich (?:iphone|phone|device|model|handset|storage|capacity)"
+    r"|what (?:storage|capacity|model)\b",
+    re.IGNORECASE,
+)
+
+# One entry of a VERIFIED HARDWARE OFFERS block:
+# "Apple iPhone 18 Pro 256GB SmartPay Ultra: $84.72/mo with tax".
+OFFER_ENTRY_RE = re.compile(
+    r"^(.*?)\s+\d+\s?(?:GB|TB)\s+SmartPay\s+\w+\s*:", re.IGNORECASE
+)
+LIST_MODELS_MAX = 3
+VENDOR_PREFIX_RE = re.compile(r"^(?:Apple|Google|Samsung)\s+", re.IGNORECASE)
+LIST_CATEGORY_RE = re.compile(
+    r"\b(iphones?|pixels?|galax(?:y|ies)|samsungs?)\b", re.IGNORECASE
+)
+# The line a model belongs to, for a caller who asked for everything without
+# naming one: "Apple iPhone 18 Pro" -> "iPhone", "Ahlo 1" -> "Ahlo".
+MODEL_LINE_RE = re.compile(
+    r"^(?:Apple|Google|Samsung)\s+(\w+)|^(\w+)", re.IGNORECASE
+)
+
+
+def offer_models(offers: str) -> list[str]:
+    """Distinct device names in a VERIFIED HARDWARE OFFERS block, newest first.
+
+    Every name comes from the dealer's own grid, so the relay can only ever
+    name a device that is actually offered. A name carrying a colon is a header
+    line that ran into the first entry ("HARDWARE OFFERS (Bell EPP, as of
+    2026-11-10) — Ontario (ON): Ahlo 1"), so it is cut at its last colon.
+    """
+    out: list[str] = []
+    for entry in (offers or "").split(";"):
+        m = OFFER_ENTRY_RE.match(entry.strip())
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if ":" in name:
+            name = name.rsplit(":", 1)[1].strip()
+        if not name or len(name) > 40 or name in out:
+            continue
+        out.append(name)
+
+    def generation(name: str) -> int:
+        m = re.search(r"\d+", name)
+        return int(m.group()) if m else -1
+
+    # Newest first: the first number in the name is the generation, so a
+    # caller asking for "all the iPhones" hears the current ones rather than
+    # whichever the grid happens to list first. Names with no number (Air,
+    # Duo) sort last.
+    out.sort(key=generation, reverse=True)
+    return out
+
+
+def _join_and(items: list[str]) -> str:
+    """'a, b, and c' for three or more, 'a and b' for two."""
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def list_reply(user_text: str) -> str | None:
+    """Name the models in the line the caller asked to see all of.
+
+    Returns None when the offers block is empty or nothing matches, so the
+    caller falls back to the generic recovery rather than hearing a list built
+    from nothing.
+    """
+    models = offer_models(_env_or("RELAY_EPP_HARDWARE_OFFERS", EPP_HARDWARE_OFFERS))
+    if not models:
+        return None
+    asked = user_text or ""
+    m = LIST_CATEGORY_RE.search(asked)
+    if m:
+        word = m.group(1).lower()
+        category = "galaxy" if word.startswith(("galax", "samsung")) else word.rstrip("s")
+        models = [x for x in models if category in x.lower()]
+        if not models:
+            return None
+        shown = [VENDOR_PREFIX_RE.sub("", x) for x in models[:LIST_MODELS_MAX]]
+        if len(shown) == 1:
+            return (
+                f"We have the {shown[0]}. Which storage size would you like a "
+                "price for?"
+            )
+        return (
+            f"We have the {_join_and(shown)}. Which one would you like a price for?"
+        )
+    # No line named: name the lines rather than mixing brands by generation
+    # number, which would put a Galaxy next to an iPhone for no reason.
+    lines: list[str] = []
+    for name in models:
+        lm = MODEL_LINE_RE.match(name)
+        if not lm:
+            continue
+        line = lm.group(1) or lm.group(2)
+        if line and line not in lines:
+            lines.append(line)
+    if not lines:
+        return None
+    if len(lines) == 1:
+        return f"We carry the {lines[0]} line. Which model would you like a price for?"
+    return (
+        f"We carry the {_join_and(lines)} lines. Which one would you like a price for?"
+    )
+
+
 def _amounts(text: str) -> set[str]:
     """Every dollar figure in `text`, normalized to a bare 2dp number string.
-
     Handles the spoken forms the model actually produces: "$62.91", "$62",
     "62.91 dollars", "62 dollars", and "62 dollars 91" (the cents said
     separately, which is how a price reads aloud).
@@ -1265,6 +1441,50 @@ def _persona_at(spoken: str, pending: str) -> int | None:
     return max(0, m.start() - len(tail))
 
 
+def _price_deflect_at(spoken: str, pending: str, user_text: str) -> int | None:
+    """Index in `pending` where a price deflection starts, or None.
+
+    Same shape as _forbidden_at. The gate holds a deflection from its first
+    words, but a reply that opens with something else ("I can help with that.
+    The store will confirm the exact price for you.") commits at four words,
+    so the deflection arrives after the commit point. A reply that names a
+    device anywhere is answering a real question and is left alone, matching
+    deflects_price_question.
+    """
+    asked = user_text or ""
+    if not PRICE_ASK_RE.search(asked):
+        return None
+    if DEVICE_NAMED_RE.search(asked) or PLAN_ASK_RE.search(asked):
+        return None
+    if DEVICE_NAMED_RE.search((spoken or "") + (pending or "")):
+        return None
+    look = 32
+    tail = (spoken or "")[-look:]
+    m = PRICE_DEFLECT_RE.search(tail + (pending or ""))
+    if not m:
+        return None
+    return max(0, m.start() - len(tail))
+
+
+def _list_ask_at(spoken: str, pending: str, user_text: str) -> int | None:
+    """Index in `pending` where a narrowing question starts, or None.
+
+    Same shape as _forbidden_at. A reply like "I can help. Which iPhone model
+    are you looking at?" commits at four words, so the narrowing question
+    arrives after the commit point and would be spoken. The lookback is wider
+    than the other guards because the pattern can start with a filler
+    ("what storage size").
+    """
+    if not LIST_ASK_RE.search(user_text or ""):
+        return None
+    look = 64
+    tail = (spoken or "")[-look:]
+    m = NARROW_RE.search(tail + (pending or ""))
+    if not m:
+        return None
+    return max(0, m.start() - len(tail))
+
+
 def is_repeat(prev: str, cur: str) -> bool:
     """True when the new reply repeats the previous one — verbatim, or, for
     long replies, near-verbatim. Backstop against the model looping the same
@@ -1692,6 +1912,28 @@ MOCK_REPLIES = {
     "termsref_late": (
         "Sure, I can help. With SmartPay you can upgrade after 12 months."
     ),
+    # A price question that named no device, answered with a deflection. The
+    # live wording from CA68caad. The deflection is the FIRST sentence, so the
+    # pre-speech gate holds it. Only reachable in MOCK_LLM mode.
+    "deflectref": (
+        "The store will confirm the exact price for you. Are you interested in "
+        "a Bell mobility plan through the Employee Purchase Program?"
+    ),
+    # The same deflection AFTER a sentence that commits the pre-speech gate, so
+    # only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "deflectref_late": (
+        "I can help with that. The store will confirm the exact price for you."
+    ),
+    # A caller asked to see every iPhone and got a narrowing question instead.
+    # The live wording from CA68caad. Held from its first words. Only reachable
+    # in MOCK_LLM mode.
+    "narrowref": "Which iPhone model and storage size are you looking at?",
+    # The same narrowing question AFTER a sentence that commits the pre-speech
+    # gate, so only the chunk scan can catch it. Only reachable in MOCK_LLM
+    # mode.
+    "narrowref_late": (
+        "I can help with that. Which iPhone model are you looking at?"
+    ),
 }
 
 
@@ -1737,6 +1979,14 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["gotnumber"]
     if "byeref" in lowered:
         return MOCK_REPLIES["bye"]
+    if "deflectref_late" in lowered:
+        return MOCK_REPLIES["deflectref_late"]
+    if "deflectref" in lowered:
+        return MOCK_REPLIES["deflectref"]
+    if "narrowref_late" in lowered:
+        return MOCK_REPLIES["narrowref_late"]
+    if "narrowref" in lowered:
+        return MOCK_REPLIES["narrowref"]
     if "vaderref_late" in lowered:
         return MOCK_REPLIES["vader_late"]
     if "vaderref" in lowered:
@@ -3101,6 +3351,40 @@ async def relay_ws(websocket: WebSocket) -> None:
                 full = WEBSITE_REPEAT_FALLBACKS[0]
                 await _flush_fallback(full)
                 return True
+            deflect = _price_deflect_at(spoken, pending, user_text)
+            if deflect is not None:
+                # A price question that named no device is being answered with
+                # a deflection. Say the safe prefix, then ask which phone, and
+                # drop the rest of the stream.
+                safe = pending[:deflect]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "price_deflect_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = DEVICE_QUESTION
+                await _flush_fallback(full)
+                return True
+            narrow = _list_ask_at(spoken, pending, user_text)
+            if narrow is not None:
+                # The caller asked to see everything in a line and is being
+                # asked to narrow it down instead. Answer from the offers
+                # block, then drop the rest of the stream.
+                safe = pending[:narrow]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "list_ask_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = list_reply(user_text) or DEAD_END_RECOVERIES[0]
+                await _flush_fallback(full)
+                return True
             persona = _persona_at(spoken, pending)
             if persona is not None:
                 # The reply is breaking character. Same treatment: say the safe
@@ -3249,6 +3533,14 @@ async def relay_ws(websocket: WebSocket) -> None:
                     _norm_text(r) == _norm_text(replacement) for r in recent_replies
                 ):
                     replacement = WEBSITE_REPEAT_FALLBACKS[1]
+            elif deflects_price_question(gate, user_text):
+                log_event(
+                    "price_deflect_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = DEVICE_QUESTION
+            elif LIST_ASK_RE.search(user_text or "") and NARROW_RE.search(gate):
+                log_event("list_ask_guard", callSid=call_sid, text=gate.strip())
+                replacement = list_reply(user_text) or DEAD_END_RECOVERIES[0]
             elif repeated is not None:
                 # A repeat in answer to a clear question is an ANSWER, not a
                 # loop: the post-pitch prompt tells the model what to say when

@@ -895,6 +895,122 @@ def main():
         check("fragment prompt is not a sign-off",
               not server.CLOSING_RE.search(prompt), prompt)
 
+    # --- Price question with no device named: on CA68caad the caller said
+    # "Take on an extra, uh, what's the price for the, um," and got "The store
+    # will confirm the exact price for you" — a deflection, when the useful
+    # next step was to ask which phone. ---
+    live_ask = "Take on an extra, uh, what's the price for the, um,"
+    live_deflect = (
+        "The store will confirm the exact price for you. Are you interested in "
+        "a Bell mobility plan through the Employee Purchase Program?"
+    )
+    check("deflects_price_question fires on the live reply",
+          server.deflects_price_question(live_deflect, live_ask) is True,
+          "not flagged")
+    for ask, why in (
+        ("how much is the iPhone 18 Pro", "the ask names a device"),
+        ("how much are the plans", "the ask is about plans"),
+        ("do you have a store in Mississauga", "there is no price ask"),
+    ):
+        check(f"deflects_price_question stays quiet when {why}",
+              server.deflects_price_question(live_deflect, ask) is False, ask)
+    check("deflects_price_question stays quiet when the reply names a device",
+          server.deflects_price_question(
+              "The iPhone 18 Pro 2TB isn't in my list, the store will confirm.",
+              live_ask) is False, "flagged a reply that names a device")
+    check("deflects_price_question stays quiet on a real answer",
+          server.deflects_price_question(
+              "The iPhone 18 Pro 256GB is $84.72 a month with tax.", live_ask)
+          is False, "flagged a real answer")
+    check("_gate_commits holds a price deflection",
+          server._gate_commits(live_deflect, (), False, live_ask) is False,
+          "committed a deflection")
+    # The gate commits at four words, so a reply that opens with something
+    # else ("I can help with that. The store will confirm...") commits before
+    # the deflection arrives. Only the chunk scan can catch that.
+    check("_price_deflect_at fires after the commit point",
+          server._price_deflect_at(
+              "I can help with that. ", "The store will confirm the exact price",
+              live_ask) is not None, "did not fire")
+    check("_price_deflect_at stays quiet when the reply names a device",
+          server._price_deflect_at(
+              "", "The store will confirm the exact price for the iPhone 18 Pro",
+              live_ask) is None, "fired on a reply that names a device")
+    check("_price_deflect_at needs a price ask",
+          server._price_deflect_at(
+              "", "The store will confirm the exact price", "hello") is None,
+          "fired without a price ask")
+
+    # --- "All the iPhones" got "Which iPhone model and storage size are you
+    # looking at?" — a narrowing question that ignores the word "all". The
+    # relay answers from the offers block instead. ---
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): Ahlo 1 "
+        "128GB SmartPay Ultra: $12.00/mo with tax; "
+        "Apple iPhone 18 Pro 256GB SmartPay Ultra: $84.72/mo with tax; "
+        "Apple iPhone 18 Pro Max 256GB SmartPay Ultra: $91.99/mo with tax; "
+        "Apple iPhone 17 Pro 128GB SmartPay Ultra: $62.91/mo with tax; "
+        "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo with tax; "
+        "Google Pixel 11 Pro 128GB SmartPay Ultra: $41.00/mo with tax; "
+        "Samsung Galaxy S26 Ultra 256GB SmartPay Ultra: $58.00/mo with tax; "
+        "Samsung Galaxy S26 128GB SmartPay Ultra: $44.00/mo with tax"
+    )
+    models = server.offer_models(os.environ["RELAY_EPP_HARDWARE_OFFERS"])
+    check("offer_models finds every distinct model", len(models) == 8, models)
+    check("offer_models cuts the header artifact at its last colon",
+          "Ahlo 1" in models, models)
+    check("offer_models puts the newest generation first",
+          models[0] == "Samsung Galaxy S26 Ultra", models)
+    check("offer_models keeps block order within a generation",
+          models.index("Apple iPhone 18 Pro")
+          < models.index("Apple iPhone 18 Pro Max"), models)
+    check("list_reply names the iPhones for 'all the iPhones'",
+          server.list_reply("All the iPhones.") == (
+              "We have the iPhone 18 Pro, iPhone 18 Pro Max, and iPhone 17 "
+              "Pro. Which one would you like a price for?"),
+          server.list_reply("All the iPhones."))
+    # "galaxies" is the plural a caller actually says, and it does not contain
+    # the substring "galaxy".
+    for ask in ("all the galaxies", "all the samsungs"):
+        check(f"list_reply maps {ask!r} to the Galaxy line",
+              server.list_reply(ask) == (
+                  "We have the Galaxy S26 Ultra and Galaxy S26. Which one "
+                  "would you like a price for?"), server.list_reply(ask))
+    check("list_reply names the single Pixel model",
+          server.list_reply("all the pixels") == (
+              "We have the Pixel 11 Pro. Which storage size would you like a "
+              "price for?"), server.list_reply("all the pixels"))
+    # A generic request must not mix brands by generation number: that put a
+    # Galaxy next to an iPhone for no reason.
+    for ask in ("all the phones", "what phones do you have"):
+        check(f"list_reply names the lines for {ask!r}",
+              server.list_reply(ask) == (
+                  "We carry the Galaxy, iPhone, Pixel, and Ahlo lines. Which "
+                  "one would you like a price for?"), server.list_reply(ask))
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    check("list_reply returns None with no offers configured",
+          server.list_reply("all the iPhones") is None, "built a list from nothing")
+    narrow = "Which iPhone model and storage size are you looking at?"
+    check("_gate_commits holds a narrowing question after a list ask",
+          server._gate_commits(narrow, (), False, "All the iPhones.") is False,
+          "committed a narrowing question")
+    check("_gate_commits leaves a narrowing question alone without a list ask",
+          server._gate_commits(narrow, (), False, "How much is the iPhone 17?")
+          is True, "held a legitimate narrowing question")
+    check("_list_ask_at fires after the commit point",
+          server._list_ask_at(
+              "I can help with that. ", "Which iPhone model are you looking at?",
+              "All the iPhones.") is not None, "did not fire")
+    check("_list_ask_at needs a list ask",
+          server._list_ask_at("", narrow, "How much is the iPhone 17?") is None,
+          "fired without a list ask")
+    for fallback in (server.DEVICE_QUESTION,):
+        check("new guard fallback is an open turn", "?" in fallback, fallback)
+        check("new guard fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
+        check("new guard fallback is not a dead end",
+              server.is_dead_end(fallback) is False, fallback)
+
     # HANDOFF_PEOPLE drives the guard, so it must stay in step with the
     # routing table or a renamed colleague silently loses the guard.
     route_labels = {label for _, label, _ in server.HANDOFF_ROUTES}
