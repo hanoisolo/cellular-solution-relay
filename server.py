@@ -462,7 +462,12 @@ def _retire_pitch_phase(history: list, state: dict) -> None:
     history[0] = {"role": "system", "content": _after_pitch_prompt()}
 
 
-def _gate_commits(partial: str, recent_replies=()) -> bool:
+def _gate_commits(
+    partial: str,
+    recent_replies=(),
+    website_spoken: bool = False,
+    user_text: str = "",
+) -> bool:
     """True once a reply being generated is past the point where it could be
     a dead end or a repeat of a recent reply."""
     t = (partial or "").strip()
@@ -496,6 +501,28 @@ def _gate_commits(partial: str, recent_replies=()) -> bool:
         return False
     # A dollar figure the offers blocks do not contain is invented.
     if invented_price(t):
+        return False
+    # So are SmartPay terms: the offers block carries prices only.
+    if claims_smartpay_terms(t):
+        return False
+    # A reply that mentions a plan is held until the stream ends, so a claim is
+    # replaced whole instead of leaving "It lets you" already spoken. The gate
+    # normally commits at four words, which is far too early here: by the time
+    # "upgrade your phone every year" arrives the caller has heard the lead-in,
+    # and a claim cannot be unsaid. "The device turn option" already carries
+    # the mention, so the hold starts before the claim does. Only plan replies
+    # pay it.
+    if SMARTPAY_MENTION_RE.search(t):
+        return False
+    # Same for the website: once the directions have been given, a reply that
+    # names the site or leads into it is held so a repeat is replaced whole
+    # rather than leaving "You can look up your company at" already spoken.
+    if website_spoken and (
+        WEBSITE_RISK_RE.search(t) or re.search(r"cellular", t, re.IGNORECASE)
+    ):
+        return False
+    # Website directions the caller has already heard are not repeated.
+    if repeats_website(t, website_spoken, user_text):
         return False
     # A price-ish reply is held until its first sentence completes, so an
     # invented figure can be replaced with the whole sentence rather than
@@ -685,6 +712,97 @@ PRICE_RISK_RE = re.compile(
     r"|\b(?:start|starts|starting) at\b|\ba month\b|\bper month\b",
     re.IGNORECASE,
 )
+
+
+# The website directions. The prompt says to say them ONCE and then offer the
+# callback, and the model said them three times in 36 seconds on CAe5216b
+# (05:02:14, 05:02:31, 05:02:50) — the same prompt-loses-to-the-model pattern
+# as the pitch loop. So the relay tracks whether it has already said them and
+# replaces a repeat with the callback offer. A caller who ASKS for the site
+# again still gets it: repeating it on request is the whole point.
+WEBSITE_RE = re.compile(
+    r"cellular\s?solution\s*(?:\.\s*ca|dot\s*c\s*a)", re.IGNORECASE
+)
+WEBSITE_ASK_RE = re.compile(
+    r"\b(?:website|web site|site|url|link)\b", re.IGNORECASE
+)
+
+# A reply that could be heading toward the website directions. The gate commits
+# at four words, so by the time "cellularsolution.ca" arrives the caller has
+# already heard "You can look up your company at". These are the lead-ins the
+# directions actually use, so the hold starts before the site does. Only
+# replies after the first mention pay it.
+WEBSITE_RISK_RE = re.compile(
+    r"\b(?:visit|click|type in|look up|lookup|website|web site|dot c a"
+    r"|eligib\w*|online)\b",
+    re.IGNORECASE,
+)
+
+# Spoken instead of a repeated website pitch. Both end in a question so the
+# dead-end guard leaves them alone, and neither matches CLOSING_RE so a
+# fallback can never end the call.
+WEBSITE_REPEAT_FALLBACKS = (
+    "The store can check that for you — would you like them to call you back?",
+    "I can have the store confirm that. Would you like a callback?",
+)
+
+# SmartPay program terms. The offers block carries PRICES only, so any claim
+# about what the plan obliges — upgrade cadence, whether the phone goes back,
+# commitment length — has no verified source. On CAe5216b the agent told a
+# caller "It lets you upgrade your phone every year with no long-term
+# commitment" and "You don't have to return the phone unless you choose a new
+# one": the invented-price problem one level up, a real figure attached to
+# invented terms. Requires BOTH a terms phrase and a plan mention in the same
+# reply, so a price quote ("the 256GB SmartPay Ultra is $70.58") is untouched.
+SMARTPAY_MENTION_RE = re.compile(
+    r"\bsmart\s?pay\b|\bdevice turn\b|\bturn option\b", re.IGNORECASE
+)
+SMARTPAY_TERMS_RE = re.compile(
+    r"\bupgrade\b[^.]{0,40}\b(?:every\s+(?:year|two years|\d+\s+months?)"
+    r"|after\s+(?:a year|\d+\s+months?|twelve months))\b"
+    r"|\b(?:don'?t|do not|won'?t|will not|never)\s+have to\s+(?:return|give back)\b"
+    r"|\b(?:have to|need to|must)\s+(?:return|give back)\s+(?:the|your|it)\b"
+    r"|\breturn (?:the|your) phone\b"
+    r"|\b(?:keep|own) (?:the|your) phone\b"
+    r"|\bno (?:long[- ]term )?(?:commitment|contract)\b"
+    r"|\b(?:12|24|36)[- ]month (?:term|commitment|contract)\b",
+    re.IGNORECASE,
+)
+
+# Spoken instead of unverified plan terms. Both end in a question so the
+# dead-end guard leaves them alone, and neither matches CLOSING_RE.
+SMARTPAY_TERMS_FALLBACKS = (
+    "I can't confirm the plan terms from here, but the store can walk you "
+    "through them — would you like them to call you back?",
+    "The store can explain exactly how the plan works. Would you like a callback?",
+)
+
+
+def repeats_website(reply: str, website_spoken: bool, user_text: str = "") -> bool:
+    """True when the reply repeats website directions already given.
+
+    The prompt says to say them once and then offer the callback; the model
+    said them three times in 36 seconds on CAe5216b. A caller who asks for
+    the site again still gets it — repeating it on request is the point.
+    """
+    if not website_spoken:
+        return False
+    if WEBSITE_ASK_RE.search(user_text or ""):
+        return False
+    return bool(WEBSITE_RE.search(reply or ""))
+
+
+def claims_smartpay_terms(reply: str) -> bool:
+    """True when the reply states SmartPay terms the relay cannot verify.
+
+    The offers block carries prices only, so upgrade cadence, the return
+    obligation and commitment length have no source. Requires BOTH a terms
+    phrase and a plan mention, so a price quote is untouched.
+    """
+    t = reply or ""
+    if not SMARTPAY_MENTION_RE.search(t):
+        return False
+    return bool(SMARTPAY_TERMS_RE.search(t))
 
 
 def _amounts(text: str) -> set[str]:
@@ -1037,6 +1155,64 @@ def _invented_price_at(
             return 0
         return max(0, cut + 2 - len(tail))
     return None
+
+
+def _website_at(
+    spoken: str, pending: str, website_spoken: bool, user_text: str = ""
+) -> int | None:
+    """Index in `pending` where a repeated website pitch starts, or None.
+
+    Same shape as _forbidden_at: the pre-speech gate only holds a reply until
+    it commits, so a second set of directions arriving after the commit point
+    would stream out unfiltered.
+    """
+    if not repeats_website(pending or "", website_spoken, user_text):
+        return None
+    look = 32
+    tail = (spoken or "")[-look:]
+    m = WEBSITE_RE.search(tail + (pending or ""))
+    if not m:
+        return None
+    return max(0, m.start() - len(tail))
+
+
+def _smartpay_terms_at(spoken: str, pending: str) -> int | None:
+    """Index in `pending` where unverified plan terms start, or None.
+
+    The mention and the terms phrase can straddle the flush boundary — "With
+    SmartPay, you pay a monthly fee" spoken, "and can upgrade after 12 months"
+    still pending — so the window covers both. The lookback is wider than the
+    other guards because the mention is often a sentence earlier than the
+    claim it qualifies.
+
+    The cut backs up to the start of the SENTENCE holding the claim, the same
+    way _invented_price_at does. The pre-speech gate commits at four words, so
+    by the time "upgrade your phone every year" arrives the caller has already
+    heard "The device turn option is the SmartPay plan. It lets you" — cutting
+    at the phrase would leave that dangling. Cutting at the sentence leaves
+    "The device turn option is the SmartPay plan." then the fallback, which
+    reads as a coherent turn.
+    """
+    look = 160
+    tail = (spoken or "")[-look:]
+    window = tail + (pending or "")
+    if not SMARTPAY_MENTION_RE.search(window):
+        return None
+    m = SMARTPAY_TERMS_RE.search(window)
+    if not m:
+        return None
+    start = m.start()
+    cut = max(
+        window.rfind(". ", 0, start),
+        window.rfind("? ", 0, start),
+        window.rfind("! ", 0, start),
+    )
+    if cut == -1:
+        # No sentence boundary to cut at, so the whole pending buffer is the
+        # lead-in. Speaking it would leave a dangling fragment before the
+        # fallback, so drop all of it.
+        return 0
+    return max(0, cut + 2 - len(tail))
 
 
 # A reply that breaks character. The input gate above stops an instruction
@@ -1497,6 +1673,25 @@ MOCK_REPLIES = {
     "shortdeny": "Okay? I can't transfer.",
     "shortpromise": "Okay? Connecting you.",
     "shortprice": "Okay? It's $35.",
+    # Website-repeat and SmartPay-terms probes. Only reachable in MOCK_LLM mode.
+    "siteref": (
+        "To check eligibility, visit cellularsolution.ca, click Employee "
+        "Offers, and type in your company name. Would you like a callback?"
+    ),
+    # Deliberately worded differently from "siteref": the live defect was three
+    # reworded pitches, which the repeat guard does not catch, so the test must
+    # not be able to pass on the repeat guard instead of the website guard.
+    "siteref2": (
+        "You can look up your company at cellularsolution.ca under Employee "
+        "Offers. Anything else I can help with?"
+    ),
+    "termsref": (
+        "The device turn option is the SmartPay plan. It lets you upgrade your "
+        "phone every year with no long-term commitment."
+    ),
+    "termsref_late": (
+        "Sure, I can help. With SmartPay you can upgrade after 12 months."
+    ),
 }
 
 
@@ -1572,6 +1767,14 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["shortpromise"]
     if "shortprice" in lowered:
         return MOCK_REPLIES["shortprice"]
+    if "termsref_late" in lowered:
+        return MOCK_REPLIES["termsref_late"]
+    if "termsref" in lowered:
+        return MOCK_REPLIES["termsref"]
+    if "siteref2" in lowered:
+        return MOCK_REPLIES["siteref2"]
+    if "siteref" in lowered:
+        return MOCK_REPLIES["siteref"]
     # Before the "price" probe: "priceref" contains "price".
     if "priceref_late" in lowered:
         return MOCK_REPLIES["priceref_late"]
@@ -1657,6 +1860,9 @@ def new_call_state() -> dict:
         # How many instruction-override attempts the caller has made. Drives
         # the rotation of INJECTION_FALLBACKS and the injection_guard log.
         "injection_attempts": 0,
+        # True once the website directions have actually been spoken, so a
+        # second set is replaced with the callback offer instead of repeated.
+        "website_spoken": False,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -2675,6 +2881,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         recent_replies=(),
         closing=False,
         user_text="",
+        website_spoken=False,
     ) -> tuple[str, float]:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -2747,6 +2954,23 @@ async def relay_ws(websocket: WebSocket) -> None:
                     spoken_box[0] += spoken
                 await send_speech(spoken, False, True, "reply")
 
+        async def _flush_fallback(text: str) -> None:
+            """Speak a replacement, guaranteeing a word boundary.
+
+            The holdback splits at a character, not a space, so a chunk can end
+            mid-word. A fallback flushed straight after one runs into it: the
+            caller hears "With SmartPay" then "I can't confirm", which the voice
+            engine reads as "SmartPayI can't". A leading space is a no-op when
+            the last chunk already ended cleanly.
+            """
+            if (
+                spoken_box is not None
+                and spoken_box[0]
+                and not spoken_box[0][-1].isspace()
+            ):
+                text = " " + text
+            await _flush(text)
+
         async def _scan_pending(final: bool = False) -> bool:
             """Scan the pending buffer for a violation, then flush what is safe.
 
@@ -2774,7 +2998,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = CALLBACK_QUESTION_FALLBACK
-                await _flush(full)
+                await _flush_fallback(full)
                 return True
             avail = _availability_at(spoken, pending)
             if avail is not None:
@@ -2792,7 +3016,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = AVAILABILITY_FALLBACKS[0]
-                await _flush(full)
+                await _flush_fallback(full)
                 return True
             denial = _transfer_denial_at(spoken, pending)
             if denial is not None:
@@ -2809,7 +3033,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = TRANSFER_FALLBACKS[0]
-                await _flush(full)
+                await _flush_fallback(full)
                 return True
             promise = _transfer_promise_at(spoken, pending)
             if promise is not None:
@@ -2826,7 +3050,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = TRANSFER_FALLBACKS[0]
-                await _flush(full)
+                await _flush_fallback(full)
                 return True
             price = _invented_price_at(spoken, pending, final=final)
             if price is not None:
@@ -2842,7 +3066,40 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = PRICE_FALLBACKS[0]
-                await _flush(full)
+                await _flush_fallback(full)
+                return True
+            terms = _smartpay_terms_at(spoken, pending)
+            if terms is not None:
+                # The reply is stating plan terms the relay cannot verify.
+                # Same treatment: say the safe prefix, then the fallback, and
+                # drop the rest of the stream.
+                safe = pending[:terms]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "smartpay_terms_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = SMARTPAY_TERMS_FALLBACKS[0]
+                await _flush_fallback(full)
+                return True
+            site = _website_at(spoken, pending, website_spoken, user_text)
+            if site is not None:
+                # The caller has already heard the website directions. Same
+                # treatment: say the safe prefix, then the callback offer.
+                safe = pending[:site]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "website_repeat_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = WEBSITE_REPEAT_FALLBACKS[0]
+                await _flush_fallback(full)
                 return True
             persona = _persona_at(spoken, pending)
             if persona is not None:
@@ -2858,7 +3115,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = INJECTION_FALLBACKS[0]
-                await _flush(full)
+                await _flush_fallback(full)
                 return True
             emit, pending = _split_pending(pending)
             await _flush(emit)
@@ -2907,7 +3164,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     else:
                         gate += token
                         if _gate_commits(
-                            gate, recent_replies
+                            gate, recent_replies, website_spoken, user_text
                         ) and not _persona_guard(gate):
                             committed = True
                             pending += gate
@@ -2974,6 +3231,24 @@ async def relay_ws(websocket: WebSocket) -> None:
                     _norm_text(r) == _norm_text(replacement) for r in recent_replies
                 ):
                     replacement = PRICE_FALLBACKS[1]
+            elif claims_smartpay_terms(gate):
+                log_event(
+                    "smartpay_terms_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = SMARTPAY_TERMS_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = SMARTPAY_TERMS_FALLBACKS[1]
+            elif repeats_website(gate, website_spoken, user_text):
+                log_event(
+                    "website_repeat_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = WEBSITE_REPEAT_FALLBACKS[0]
+                if any(
+                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
+                ):
+                    replacement = WEBSITE_REPEAT_FALLBACKS[1]
             elif repeated is not None:
                 # A repeat in answer to a clear question is an ANSWER, not a
                 # loop: the post-pitch prompt tells the model what to say when
@@ -3006,7 +3281,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     replacement = DEAD_END_RECOVERIES[1]
             if replacement is not None:
                 full = replacement
-                await _flush(replacement)
+                await _flush_fallback(replacement)
                 gate = ""
             pending += gate
         if committed and pending:
@@ -3663,6 +3938,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             recent_replies=state["recent_replies"],
                             closing=closing,
                             user_text=user_text,
+                            website_spoken=state["website_spoken"],
                         )
                     )
                     reply = ""
@@ -3778,6 +4054,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                     llm_task = None
 
                 if reply:
+                    # The directions were spoken this turn, so a second set is
+                    # a repeat. Set from what was actually said, not from what
+                    # the model generated: a reply the gate replaced with a
+                    # fallback never contained the site.
+                    if WEBSITE_RE.search(reply):
+                        state["website_spoken"] = True
                     # What the caller actually heard, kept for the pre-speech
                     # gate on the next turn. History cannot serve this: an
                     # interrupt truncates the assistant turn to the fragment

@@ -751,6 +751,121 @@ def main():
         check("price fallback quotes no figure",
               server.invented_price(fallback) is False, fallback)
 
+    # --- Website repeat: the prompt says to give the directions once and then
+    # offer the callback. On CAe5216b the model gave them three times in 36
+    # seconds (05:02:14, 05:02:31, 05:02:50), so the relay tracks whether it
+    # has already said them. ---
+    site = "Visit cellularsolution.ca, click Employee Offers, and type in your name."
+    check("repeats_website allows the first mention",
+          server.repeats_website(site, False) is False, "blocked the first mention")
+    check("repeats_website blocks a second mention",
+          server.repeats_website(site, True) is True, "let a repeat through")
+    check("repeats_website matches the spoken form",
+          server.repeats_website(
+              "visit cellular solution dot c a and click Employee Offers", True
+          ) is True, "missed the spoken form")
+    check("repeats_website allows a repeat the caller asked for",
+          server.repeats_website(site, True, "what's your website again?") is False,
+          "blocked a repeat the caller asked for")
+    check("repeats_website ignores a reply with no site",
+          server.repeats_website("The store can help with that.", True) is False,
+          "fired on a reply with no site")
+    check("_gate_commits holds a repeated website pitch",
+          server._gate_commits(site, (), True, "tell me about epp") is False,
+          "committed a repeated website pitch")
+    check("_gate_commits lets the first website mention through",
+          server._gate_commits(site, (), False, "tell me about epp") is True,
+          "held the first website mention")
+    # The gate commits at four words, so the hold has to start on the lead-in,
+    # not on the site: by the time "cellularsolution.ca" arrives the caller has
+    # already heard "You can look up your company at".
+    check("_gate_commits holds a website lead-in after the first mention",
+          server._gate_commits(
+              "You can look up your company at", (), True, "tell me about epp"
+          ) is False, "committed a website lead-in")
+    check("_gate_commits lets a website lead-in through before the first mention",
+          server._gate_commits(
+              "You can look up your company at", (), False, "tell me about epp"
+          ) is True, "held the first website lead-in")
+    check("_website_at fires on a repeated pitch after the commit point",
+          server._website_at("", "Sure, I can help. Visit cellularsolution.ca", True)
+          is not None, "did not fire")
+    check("_website_at stays quiet on the first mention",
+          server._website_at("", "Sure, I can help. Visit cellularsolution.ca", False)
+          is None, "fired on the first mention")
+
+    # --- SmartPay terms: the offers block carries prices only, so upgrade
+    # cadence, the return obligation and commitment length have no source. On
+    # CAe5216b the agent told a caller "It lets you upgrade your phone every
+    # year with no long-term commitment" and "You don't have to return the
+    # phone unless you choose a new one". ---
+    for text in (
+        "The device turn option is the SmartPay plan. It lets you upgrade your "
+        "phone every year with no long-term commitment.",
+        "With SmartPay, you pay a monthly fee for the phone and can upgrade "
+        "after 12 months.",
+        "With SmartPay, you don't have to return the phone unless you choose a "
+        "new one.",
+        "SmartPay has no contract.",
+        "The turn option is a 24-month term.",
+    ):
+        check("claims_smartpay_terms flags unverified terms",
+              server.claims_smartpay_terms(text) is True, text)
+    for text in (
+        "The Google Pixel 11 Pro 256GB SmartPay Ultra is $70.58/mo with tax.",
+        "SmartPay is a monthly payment plan. The store can confirm the upgrade "
+        "terms.",
+        "The store can help with that.",
+        "You don't have to decide right now.",
+        # The AND is deliberate: a return/upgrade phrase with no plan mention
+        # is about something else, and replacing it would be a false positive.
+        "You don't have to return the phone unless you choose a new one.",
+    ):
+        check("claims_smartpay_terms leaves a price quote alone",
+              server.claims_smartpay_terms(text) is False, text)
+    check("_gate_commits holds unverified plan terms",
+          server._gate_commits(
+              "The device turn option is the SmartPay plan. It lets you upgrade "
+              "your phone every year with no long-term commitment.", ()
+          ) is False, "committed unverified plan terms")
+    # The gate commits at four words, so the hold has to start on the mention,
+    # not on the claim: by the time "upgrade your phone every year" arrives the
+    # caller has already heard "It lets you", and a claim cannot be unsaid.
+    check("_gate_commits holds a plan reply from its first words",
+          server._gate_commits("The device turn option", ()) is False,
+          "committed a plan reply before the claim arrived")
+    # The cost of the hold, pinned so it is a decision rather than a surprise:
+    # a plan reply with no claim in it is still buffered to end of stream, then
+    # spoken. That is the price of never speaking a claim that cannot be
+    # unsaid.
+    check("_gate_commits holds a plan reply even with no claim",
+          server._gate_commits("SmartPay is a monthly payment plan.", ()) is False,
+          "a plan reply streamed before its claim could arrive")
+    check("_smartpay_terms_at fires after the commit point",
+          server._smartpay_terms_at(
+              "Sure, I can help. With SmartPay you can ", "upgrade after 12 months."
+          ) is not None, "did not fire")
+    check("_smartpay_terms_at needs a plan mention",
+          server._smartpay_terms_at("", "You can upgrade after 12 months.") is None,
+          "fired without a plan mention")
+    # The gate commits at four words, so by the time the claim arrives the
+    # caller has heard "It lets you". Cutting at the phrase would leave that
+    # dangling; cutting at the sentence leaves a coherent turn.
+    terms_text = (
+        "The device turn option is the SmartPay plan. It lets you upgrade your "
+        "phone every year with no long-term commitment."
+    )
+    check("_smartpay_terms_at cuts back to the sentence start",
+          server._smartpay_terms_at("", terms_text)
+          == len("The device turn option is the SmartPay plan. "),
+          f"cut at {server._smartpay_terms_at('', terms_text)}")
+    for fallback in server.WEBSITE_REPEAT_FALLBACKS + server.SMARTPAY_TERMS_FALLBACKS:
+        check("new guard fallback is an open turn", "?" in fallback, fallback)
+        check("new guard fallback is not a sign-off",
+              not server.CLOSING_RE.search(fallback), fallback)
+        check("new guard fallback is not a dead end",
+              server.is_dead_end(fallback) is False, fallback)
+
     # --- Fragment turns: a one- or two-word utterance is a clipped line, not
     # an answer. On CAe33eb7 "It" drew a 294-character, 25-second EPP pitch and
     # "My." drew "It sounds like you may have something to share." ---

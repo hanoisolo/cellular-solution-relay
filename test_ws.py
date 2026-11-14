@@ -2721,6 +2721,119 @@ async def check_short_tail_guard_ws():
     )
 
 
+async def check_website_repeat_guard_ws():
+    """End-to-end: the website directions are spoken once, then replaced.
+
+    The prompt says to give them once and then offer the callback. On CAe5216b
+    the model gave them three times in 36 seconds (05:02:14, 05:02:31,
+    05:02:50), so the relay tracks whether it has already said them.
+    """
+    from server import WEBSITE_REPEAT_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000036"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref",
+                    "last": True,
+                }
+            )
+        )
+        first = await _collect_reply(ws)
+        # The first mention is the point of the directions, so it is spoken.
+        assert "cellular solution dot c a" in first, (
+            f"the first website mention was not spoken: {first!r}"
+        )
+        assert not any(f in first for f in WEBSITE_REPEAT_FALLBACKS), (
+            f"the first website mention was replaced: {first!r}"
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref2",
+                    "last": True,
+                }
+            )
+        )
+        second = await _collect_reply(ws)
+        assert any(f in second for f in WEBSITE_REPEAT_FALLBACKS), (
+            f"a repeated website pitch was not replaced: {second!r}"
+        )
+        assert "cellular solution dot c a" not in second, (
+            f"the website directions were repeated: {second!r}"
+        )
+    print(
+        "WEBSITE REPEAT GUARD WS: pass — the directions are spoken once, then "
+        "replaced with the callback offer"
+    )
+
+
+async def check_smartpay_terms_guard_ws():
+    """End-to-end: unverified SmartPay terms are replaced before they are
+    spoken, and a claim arriving after the commit point is caught too.
+
+    The offers block carries prices only, so upgrade cadence, the return
+    obligation and commitment length have no source. On CAe5216b the agent
+    told a caller "It lets you upgrade your phone every year with no long-term
+    commitment" and "You don't have to return the phone unless you choose a
+    new one".
+    """
+    from server import SMARTPAY_TERMS_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000037"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about termsref",
+                    "last": True,
+                }
+            )
+        )
+        spoken = await _collect_reply(ws)
+        assert any(f in spoken for f in SMARTPAY_TERMS_FALLBACKS), (
+            f"unverified plan terms were not replaced: {spoken!r}"
+        )
+        for word in ("upgrade", "commitment"):
+            assert word not in spoken.lower(), (
+                f"unverified plan terms were spoken: {spoken!r}"
+            )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about termsref_late",
+                    "last": True,
+                }
+            )
+        )
+        late = await _collect_reply(ws)
+        # The late path speaks the safe prefix, then the fallback — the same
+        # contract as the other late guards. What matters is that the claim
+        # itself is never spoken.
+        assert any(f in late for f in SMARTPAY_TERMS_FALLBACKS), (
+            f"late plan terms were not replaced: {late!r}"
+        )
+        assert "upgrade after 12 months" not in late.lower(), (
+            f"late plan terms were spoken: {late!r}"
+        )
+    print(
+        "SMARTPAY TERMS GUARD WS: pass — unverified plan terms are replaced"
+    )
+
+
 async def main():
     print(f"Connecting to {WS_URL} ...")
     async with websockets.connect(WS_URL, max_size=2**20) as ws:
@@ -3188,6 +3301,8 @@ async def main():
     await check_injection_guard_ws()
     await check_persona_break_guard_ws()
     await check_short_tail_guard_ws()
+    await check_website_repeat_guard_ws()
+    await check_smartpay_terms_guard_ws()
     await check_pitch_turn_capture_ws()
     await check_post_pitch_answer_ws()
     await check_phone_ambiguous_ws()
