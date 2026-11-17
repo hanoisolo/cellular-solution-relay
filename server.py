@@ -2568,26 +2568,56 @@ def _speakable_text(text: str) -> str:
     return spoken
 
 
+# The full written and spoken forms of the site, so a split can be kept out of
+# the middle of any of them.
+_SITE_SPAN_RE = re.compile(
+    r"(?<!@)(?:www\.)?cellular\s?solution\s*(?:\.\s*ca|dot\s*c\s*a)",
+    re.IGNORECASE,
+)
+# A site that has started but not finished, at the very end of the text.
+_SITE_PARTIAL_RE = re.compile(
+    r"(?<!@)(?:www\.)?cellular\s?solution"
+    r"(?:\s*(?:\.\s*c?a?|dot(?:\s*c(?:\s*a?)?)?))?$",
+    re.IGNORECASE,
+)
+
+
 def _split_holdback(text: str, hold_back: int = 40) -> tuple[str, str]:
     """Split streamed text into (safe to emit, hold back).
 
     The emit part ends `hold_back` characters behind the frontier, so a
     website address (at most 25 characters) plus any comma after it always
-    stays whole inside the held-back tail until it is complete. A split is
-    never made inside the address: if it starts before the split point,
-    the split moves back to its start (including a preceding 'www.').
+    stays whole inside the held-back tail until it is complete.
+
+    Two things are never split:
+
+    * A WORD. The split used to land on a bare character offset, so "visit"
+      went out as "v" + "isit" and the voice engine read the lone "v" as
+      "vee". On CA17596d the caller heard that as a glitch on "visit".
+    * A WEBSITE ADDRESS. The old rule moved the split back to the address
+      start whenever the address began before it, which stalled the stream
+      the moment the address reached the front of the buffer: everything
+      after "visit" was held until the model finished the reply, so the
+      caller heard dead air mid-sentence. The split now moves only when it
+      actually falls INSIDE a complete address, and an address still
+      arriving at the end of the buffer is held from its start.
     """
     split = max(0, len(text) - hold_back)
-    low = text.lower()
-    m = None
-    for m in re.finditer(r"cellular\s?solution", low):
-        pass  # keep the last match
-    if m is not None:
-        start = m.start()
-        if low[max(0, start - 4):start] == "www.":
-            start -= 4
-        if start < split:
-            split = start
+    # Back up to the last space so a word is never cut in half. With no space
+    # before the split point the first word is longer than the holdback, so
+    # hold everything rather than emit a fragment of it.
+    space = text.rfind(" ", 0, split)
+    split = space + 1 if space >= 0 else 0
+    straddles = next(
+        (m for m in _SITE_SPAN_RE.finditer(text) if m.start() < split < m.end()),
+        None,
+    )
+    if straddles is not None:
+        split = straddles.start()
+    else:
+        partial = _SITE_PARTIAL_RE.search(text)
+        if partial is not None and partial.start() < split:
+            split = partial.start()
     return text[:split], text[split:]
 
 

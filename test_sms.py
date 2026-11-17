@@ -876,6 +876,74 @@ def main():
               f"Visit cellularsolution.ca or email {email}.", True, "okay"
           ) is True, "let a repeat through because it also carried the email")
 
+    # --- Chunking. On CA17596d the caller heard a glitch on the word "visit".
+    # Two causes, both in _split_holdback: the split landed on a bare character
+    # offset so "visit" went out as "v" + "isit" (a lone "v" is read as "vee"),
+    # and once the address reached the front of the buffer the old rule forced
+    # split=0, holding the whole rest of the reply until the model finished —
+    # dead air mid-sentence. ---
+    def _stream_chunks(reply, hold_back=26):
+        """Replay a reply word by word through _split_holdback."""
+        pending, out = "", []
+        for word in reply.split(" "):
+            pending += word + " "
+            if len(pending) > hold_back:
+                emit, pending = server._split_holdback(pending, hold_back)
+                if emit:
+                    out.append(emit)
+        if pending:
+            out.append(pending)
+        return out
+
+    visit_reply = (
+        "To check if your employer is eligible, visit cellularsolution.ca, "
+        "click Employee Offers, and type in your company name."
+    )
+    chunks = _stream_chunks(visit_reply)
+    check("_split_holdback never cuts a word in half",
+          all(c.endswith(" ") for c in chunks[:-1]),
+          [c for c in chunks if not c.endswith(" ")])
+    check("_split_holdback keeps 'visit' whole",
+          any("visit" in c for c in chunks)
+          and not any(c.rstrip().endswith("v") for c in chunks),
+          [c for c in chunks if "vis" in c or c.rstrip().endswith("v")])
+    check("_split_holdback keeps the address in one chunk",
+          sum("cellularsolution" in c for c in chunks) == 1,
+          [c for c in chunks if "cellular" in c])
+    site_at = next(i for i, c in enumerate(chunks) if "cellularsolution" in c)
+    check("_split_holdback does not stall the stream at the address",
+          site_at < len(chunks) - 1,
+          f"the address was the last chunk: {chunks[site_at:]!r}")
+    # The stall was split=0 whenever the address began the buffer. It must
+    # emit past a complete address instead of holding everything.
+    emit, rest = server._split_holdback(
+        "cellularsolution.ca, click Employee Offers, and type in your name.", 26
+    )
+    check("_split_holdback emits past an address that starts the buffer",
+          emit.startswith("cellularsolution.ca"),
+          f"emitted {emit!r}")
+    # The held tail is the holdback plus at most one word, because the split
+    # backs up to a space. What matters is that the emit carries the address
+    # AND the words after it, instead of holding the whole remainder.
+    check("_split_holdback emits the words after the address too",
+          emit.startswith("cellularsolution.ca, click"),
+          f"emitted {emit!r}")
+    check("_split_holdback holds only a tail, not the whole remainder",
+          len(emit) > len(rest), f"emit {len(emit)} vs held {len(rest)}")
+    # An email address is not the site, so it must not stall the stream either.
+    emit, rest = server._split_holdback(
+        "corpsales@cellularsolution.ca is the address to use for questions.", 26
+    )
+    check("_split_holdback does not stall on an email address",
+          emit != "", "emitted nothing — the stream would stall")
+    # The address still reaches the voice engine in its spoken form, joined to
+    # the next words with "and" rather than a comma.
+    check("_speakable_text joins the address to the next words",
+          server._speakable_text(
+              "visit cellularsolution.ca, click Employee Offers"
+          ) == "visit cellular solution dot c a and click Employee Offers",
+          server._speakable_text("visit cellularsolution.ca, click Employee Offers"))
+
     # --- SmartPay terms: the offers block carries prices only, so upgrade
     # cadence, the return obligation and commitment length have no source. On
     # CAe5216b the agent told a caller "It lets you upgrade your phone every
