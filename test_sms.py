@@ -642,6 +642,11 @@ def main():
         "Can you transfer me to billing?",
         "Please connect me to someone in support",
         "Can you put me through to the store?",
+        # "transfer my call" is the same request as "transfer me". On CA0277e6
+        # the caller said exactly this and the net missed it, so the model
+        # answered with a promise instead of the relay connecting them.
+        "Okay. Uh, you know, what can you transfer my call to the store?",
+        "Can you transfer my call to the store?",
     ):
         route = server.handoff_route(text)
         check(f"handoff_route transfer request {text!r} -> 225",
@@ -667,6 +672,10 @@ def main():
         "I'll transfer you now.",
         "One moment while I connect you.",
         "Connecting you to the store.",
+        # The party doing the connecting sits between the modal and the verb.
+        # On CA0277e6 the agent said this and no handoff fired that turn.
+        "I can have the store connect you now.",
+        "I can have someone transfer you.",
     ):
         check(f"TRANSFER_PROMISE_RE matches {promise!r}",
               server.TRANSFER_PROMISE_RE.search(promise) is not None, promise)
@@ -675,6 +684,11 @@ def main():
         "Would you like the store to call you back?",
         "The store can help with that.",
         "I can't transfer calls.",
+        # The bounded gap must not turn an ordinary "can ... connect" sentence
+        # into a promise: these are all things the agent may legitimately say.
+        "You can connect your phone to Wi-Fi.",
+        "I can help you connect to the portal.",
+        "I can transfer your number to Bell.",
         # The fallbacks themselves must never trip the guard, or it loops.
         *server.TRANSFER_FALLBACKS,
     ):
@@ -819,6 +833,48 @@ def main():
     check("_website_at stays quiet on the first mention",
           server._website_at("", "Sure, I can help. Visit cellularsolution.ca", False)
           is None, "fired on the first mention")
+
+    # --- The store's EMAIL ADDRESS is not the website directions. The dealer
+    # address is corpsales@cellularsolution.ca and the knowledge base tells the
+    # agent to give it out, but the domain inside it matched WEBSITE_RE, so on
+    # CA0277e6 a caller who asked twice for the email was deflected twice with
+    # a callback offer and never got it. ---
+    email = "corpsales@cellularsolution.ca"
+    check("WEBSITE_RE does not match an email address",
+          server.WEBSITE_RE.search(email) is None, "matched the email domain")
+    check("WEBSITE_RE still matches the site itself",
+          server.WEBSITE_RE.search("visit cellularsolution.ca") is not None,
+          "stopped matching the site")
+    check("repeats_website allows the store's email address",
+          server.repeats_website(f"The store's email is {email}.", True,
+                                 "what's their email address?") is False,
+          "blocked the email address")
+    # The lookbehind is the fix, not the ask exemption: this reply is allowed
+    # even when the caller never asked for the site.
+    check("repeats_website allows the email even with no ask",
+          server.repeats_website(email, True, "okay") is False,
+          "blocked the email with no ask")
+    check("repeats_website allows an email inside a longer reply",
+          server.repeats_website(
+              f"You can email us at {email}.", True, "how do I reach you?"
+          ) is False, "blocked a reply that only carries the email")
+    check("WEBSITE_ASK_RE treats an email ask as an ask",
+          server.WEBSITE_ASK_RE.search("give me the full email address")
+          is not None, "did not recognise an email ask")
+    # The two sites that can REPLACE a reply are repeats_website (end of
+    # stream) and _website_at (mid-stream). Both must stay quiet on the email,
+    # or the caller is deflected instead of given the address. The pre-speech
+    # gate still buffers the reply to end of stream because it contains
+    # "cellular" — that costs latency, not correctness.
+    check("_website_at stays quiet on an email address",
+          server._website_at("", f"The store's email is {email}.", True,
+                             "what's their email address?") is None,
+          "fired on an email address")
+    # A reply that gives BOTH is still a repeat of the directions.
+    check("repeats_website still blocks a reply carrying the site and the email",
+          server.repeats_website(
+              f"Visit cellularsolution.ca or email {email}.", True, "okay"
+          ) is True, "let a repeat through because it also carried the email")
 
     # --- SmartPay terms: the offers block carries prices only, so upgrade
     # cadence, the return obligation and commitment length have no source. On

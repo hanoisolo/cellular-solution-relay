@@ -679,8 +679,15 @@ TRANSFER_FALLBACKS = (
 # and then "I'm connecting you to the store at 905-264-2228 now." No handoff
 # fired: the caller was told twice they were being connected and stayed on the
 # line. A false promise is worse than a denial, so it is guarded the same way.
+#
+# The party doing the connecting can sit between the modal and the verb. On
+# CA0277e6 the agent said "I can have the store connect you now" — no handoff
+# fired that turn, and the caller only got connected because they asked again
+# ("Okay, connect me."). The bounded gap covers that form without letting an
+# unrelated "can ... connect" sentence through.
 TRANSFER_PROMISE_RE = re.compile(
     r"\b(?:i'?m|i am|i'?ll|i will|we'?re|we are|let me|can|could)\s+"
+    r"(?:\w+\s+){0,4}"
     r"(?:connect|transfer|put)(?:ing)?\s+(?:you|them)\b"
     r"|\bconnecting you\b|\btransferring you\b|\bputting you through\b"
     r"|\bone moment while i\b",
@@ -737,11 +744,20 @@ PRICE_RISK_RE = re.compile(
 # as the pitch loop. So the relay tracks whether it has already said them and
 # replaces a repeat with the callback offer. A caller who ASKS for the site
 # again still gets it: repeating it on request is the whole point.
+#
+# The lookbehind keeps an EMAIL ADDRESS out of this. The dealer's address is
+# corpsales@cellularsolution.ca and the knowledge base tells the agent to give
+# it out, but the domain inside it matched this pattern, so on CA0277e6 a
+# caller who asked twice for the store's email was deflected twice with a
+# callback offer and never got it. An email address is not the website
+# directions, so it is not a repeat of them.
 WEBSITE_RE = re.compile(
-    r"cellular\s?solution\s*(?:\.\s*ca|dot\s*c\s*a)", re.IGNORECASE
+    r"(?<!@)cellular\s?solution\s*(?:\.\s*ca|dot\s*c\s*a)", re.IGNORECASE
 )
+# "email" belongs here for the same reason: a caller asking for the address is
+# asking for something the agent may repeat freely.
 WEBSITE_ASK_RE = re.compile(
-    r"\b(?:website|web site|site|url|link)\b", re.IGNORECASE
+    r"\b(?:website|web site|site|url|link|e-?mail)\b", re.IGNORECASE
 )
 
 # A reply that could be heading toward the website directions. The gate commits
@@ -2403,9 +2419,13 @@ def handoff_digit_pause(extension: str = "") -> str:
 # ("transfer me to billing", "can you connect me") so the caller is connected
 # to the store instead of being told the agent cannot transfer. Deliberately
 # requires "me"/"us"/"this call" after the verb: "can I transfer my number to
-# Bell?" is a port-in question, not a request to be put through.
+# Bell?" is a port-in question, not a request to be put through. "my call" is
+# in the list because on CA0277e6 the caller said "what can you transfer my
+# call to the store?" and the net missed it, so the model answered with a
+# promise instead of the relay connecting them.
 TRANSFER_REQUEST_RE = re.compile(
-    r"\b(?:transfer|connect|put)\s+(?:me|us)\b|\btransfer\s+(?:this|the)\s+call\b",
+    r"\b(?:transfer|connect|put)\s+(?:me|us)\b"
+    r"|\btransfer\s+(?:this|the|my|your)\s+call\b",
     re.IGNORECASE,
 )
 
