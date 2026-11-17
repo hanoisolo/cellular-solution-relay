@@ -779,6 +779,38 @@ WEBSITE_REPEAT_FALLBACKS = (
     "I can have the store confirm that. Would you like a callback?",
 )
 
+# Used once the caller has declined a callback, and once both offers above
+# have been spoken. Offering a callback the caller just refused is what made
+# CA8c6b41 a dead end: "No, that's okay." was answered with "Would you like a
+# callback?" one second later, and the caller then said "No" three more times.
+WEBSITE_REPEAT_NO_CALLBACK = (
+    "Is there anything else about the plans I can explain?",
+    "What else can I help you with today?",
+)
+
+
+def website_repeat_fallback(
+    recent_replies=(), callback_declined: bool = False
+) -> str:
+    """The line to speak instead of repeated website directions.
+
+    Picks the first variant the caller has not already heard. The rotation
+    used to check only the first entry and then use the second unchecked, so a
+    third firing repeated the second and tripped the repeat guard, replacing a
+    usable line with "let me put that another way". Once the callback offers
+    are spent — or the caller has declined one — it moves to the non-callback
+    lines rather than asking again.
+    """
+    options = (
+        WEBSITE_REPEAT_NO_CALLBACK
+        if callback_declined
+        else WEBSITE_REPEAT_FALLBACKS + WEBSITE_REPEAT_NO_CALLBACK
+    )
+    for option in options:
+        if not any(_norm_text(r) == _norm_text(option) for r in recent_replies):
+            return option
+    return options[-1]
+
 # SmartPay program terms. The offers block carries PRICES only, so any claim
 # about what the plan obliges — upgrade cadence, whether the phone goes back,
 # commitment length — has no verified source. On CAe5216b the agent told a
@@ -2160,6 +2192,10 @@ def new_call_state() -> dict:
         "expecting_name": False,
         "name_attempts": 0,
         "callback_offered": False,
+        # True once the caller has turned a callback offer down. The website
+        # repeat guard's fallback is itself a callback offer, so it must not
+        # ask again after a decline.
+        "callback_declined": False,
         "recording_disclosed": False,
         "caller_turns": 0,
         "interrupted": False,
@@ -3247,6 +3283,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         closing=False,
         user_text="",
         website_spoken=False,
+        callback_declined=False,
     ) -> tuple[str, float]:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -3463,7 +3500,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                     callSid=call_sid,
                     text=full.strip(),
                 )
-                full = WEBSITE_REPEAT_FALLBACKS[0]
+                full = website_repeat_fallback(recent_replies, callback_declined)
                 await _flush_fallback(full)
                 return True
             deflect = _price_deflect_at(spoken, pending, user_text)
@@ -3643,11 +3680,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                 log_event(
                     "website_repeat_guard", callSid=call_sid, text=gate.strip()
                 )
-                replacement = WEBSITE_REPEAT_FALLBACKS[0]
-                if any(
-                    _norm_text(r) == _norm_text(replacement) for r in recent_replies
-                ):
-                    replacement = WEBSITE_REPEAT_FALLBACKS[1]
+                replacement = website_repeat_fallback(
+                    recent_replies, callback_declined
+                )
             elif deflects_price_question(gate, user_text):
                 log_event(
                     "price_deflect_guard", callSid=call_sid, text=gate.strip()
@@ -3897,6 +3932,17 @@ async def relay_ws(websocket: WebSocket) -> None:
                 caller_spoke = True
                 idle_prompts = 0
                 state["caller_turns"] += 1
+
+                # A caller who declines the callback must not be offered it
+                # again. The website repeat guard's fallback IS a callback
+                # offer, so on CA8c6b41 "No, that's okay." was answered with
+                # "Would you like a callback?" one second later.
+                if (
+                    state["callback_offered"]
+                    and not state["callback_logged"]
+                    and NEGATIVE_RE.search(user_text)
+                ):
+                    state["callback_declined"] = True
 
                 # Caller asked for a person, or for one of the destinations the
                 # store routes by extension ("is Neelam there?", "accounts
@@ -4346,6 +4392,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             closing=closing,
                             user_text=user_text,
                             website_spoken=state["website_spoken"],
+                            callback_declined=state["callback_declined"],
                         )
                     )
                     reply = ""

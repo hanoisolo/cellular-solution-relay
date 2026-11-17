@@ -2775,6 +2775,104 @@ async def check_website_repeat_guard_ws():
     )
 
 
+async def check_website_decline_guard_ws():
+    """A caller who declines the callback is not offered it again.
+
+    On CA8c6b41 the caller said "No, that's okay." and the website repeat
+    guard answered "Would you like a callback?" one second later, then the
+    caller said "No" three more times. The guard's fallback IS a callback
+    offer, so it has to know the caller already declined one.
+    """
+    from server import (  # noqa: E402
+        WEBSITE_REPEAT_FALLBACKS,
+        WEBSITE_REPEAT_NO_CALLBACK,
+    )
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000042"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        # Turn 1: the directions are spoken, and the reply offers a callback,
+        # so the relay knows an offer is outstanding.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref",
+                    "last": True,
+                }
+            )
+        )
+        first = await _collect_reply(ws)
+        assert "cellular solution dot c a" in first, (
+            f"the first website mention was not spoken: {first!r}"
+        )
+        # Turn 2: the caller declines, and the model re-emits the directions.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No thanks, siteref2",
+                    "last": True,
+                }
+            )
+        )
+        second = await _collect_reply(ws)
+        assert not any(f in second for f in WEBSITE_REPEAT_FALLBACKS), (
+            f"a declined callback was offered again: {second!r}"
+        )
+        assert any(f in second for f in WEBSITE_REPEAT_NO_CALLBACK), (
+            f"the repeat was not replaced with a non-callback line: {second!r}"
+        )
+    print(
+        "WEBSITE DECLINE GUARD WS: pass — a declined callback is not offered again"
+    )
+
+
+async def check_website_fallback_rotation_ws():
+    """Three firings must produce three different lines.
+
+    The rotation checked only the first variant and then used the second
+    unchecked, so a third firing repeated the second and tripped the repeat
+    guard. On CA8c6b41 the caller heard "Let me put that another way" instead
+    of anything useful.
+    """
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000043"
+    setup["direction"] = "inbound"
+    spoken = []
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref",
+                    "last": True,
+                }
+            )
+        )
+        await _collect_reply(ws)
+        for _ in range(3):
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "prompt",
+                        "voicePrompt": "Tell me about siteref2",
+                        "last": True,
+                    }
+                )
+            )
+            spoken.append(await _collect_reply(ws))
+    assert len(set(spoken)) == 3, f"a fallback was repeated: {spoken!r}"
+    print(
+        "WEBSITE FALLBACK ROTATION WS: pass — three firings, three different lines"
+    )
+
+
 async def check_smartpay_terms_guard_ws():
     """End-to-end: unverified SmartPay terms are replaced before they are
     spoken, and a claim arriving after the commit point is caught too.
@@ -3420,6 +3518,8 @@ async def main():
     await check_persona_break_guard_ws()
     await check_short_tail_guard_ws()
     await check_website_repeat_guard_ws()
+    await check_website_decline_guard_ws()
+    await check_website_fallback_rotation_ws()
     await check_smartpay_terms_guard_ws()
     await check_price_deflect_guard_ws()
     await check_list_ask_guard_ws()
