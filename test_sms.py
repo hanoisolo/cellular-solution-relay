@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import server  # noqa: E402
+from inbound_knowledge import INBOUND_KNOWLEDGE  # noqa: E402
 from server import (  # noqa: E402
     app,
     message_twiml_xml,
@@ -717,6 +718,19 @@ def main():
           server.invented_price(
               "The iPhone 17 is $62.91 a month and plans start at $35.")
           is True, "not flagged")
+    # The two fixed Bell fees are not in the offers blocks, so the guard has to
+    # allow them explicitly. Without that, a correct answer about the $40
+    # device handling fee is replaced with the price fallback and the caller
+    # never hears the fee.
+    check("invented_price: the $40 device handling fee is allowed",
+          server.invented_price(
+              "A hardware upgrade carries Bell's one-time $40 device handling "
+              "fee on your next bill.") is False, "flagged")
+    check("invented_price: the $50 open-box return fee is allowed",
+          server.invented_price(
+              "An open-box return has a $50 fee.") is False, "flagged")
+    check("invented_price: a figure near the fixed fees is still invented",
+          server.invented_price("The fee is $45.") is True, "not flagged")
     os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
     check("_gate_commits holds an invented price",
           server._gate_commits(
@@ -742,6 +756,18 @@ def main():
     check("_invented_price_at fires on a trailing figure at end of stream",
           server._invented_price_at("", "$35", final=True) == 0,
           "a trailing invented figure was not caught at end of stream")
+    # The mid-stream scan reads the same allowlist as the whole-reply check.
+    # It used to read the offers blocks alone, so a reply carrying a fee and an
+    # invented figure was cut at the fee instead of at the invented figure.
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "iPhone 17 256GB SmartPay Ultra $62.91 a month with tax"
+    )
+    check("_invented_price_at cuts at the invented figure, not the fee",
+          server._invented_price_at(
+              "", "The $40 device handling fee applies. Plans start at $35.")
+          == len("The $40 device handling fee applies. "),
+          "cut at the wrong figure")
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
     check("_gate_commits lets the price fallback through",
           server._gate_commits(server.PRICE_FALLBACKS[0]) is True, "held")
     for fallback in server.PRICE_FALLBACKS:
