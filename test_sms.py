@@ -438,6 +438,40 @@ def main():
               route is not None and route[0] == expected,
               f"{route!r}")
 
+    # Both word orders ask for the same thing. Only the verb-first form was
+    # matched at first, so on CA963af2 the caller's "Is there a person I can
+    # speak to now?" fell through to the model, which offered a callback
+    # instead of connecting them. "speak with" is the same request as "speak
+    # to", and a bare "I need a person" is the same request again.
+    for text in (
+        "Is there a person I can speak to now?",
+        "Is there someone I can talk to?",
+        "Is there somebody I could speak with?",
+        "Is there anyone I can talk to?",
+        "Is there a person to speak to?",
+        "Is there a person available to talk to?",
+        "Can I speak with a person?",
+        "I'd like to speak with someone",
+        "I need a person",
+        "Can I get a person on the line?",
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route word order {text!r} -> 225",
+              route is not None and route[0] == "225", f"{route!r}")
+
+    # ...but a negated or possessive mention of a person is not a request for
+    # one, and neither is a plan feature that happens to use the word.
+    for text in (
+        "I don't need a person, I'll do it online",
+        "I do not want a person",
+        "I need a person's name for the form",
+        "Does the plan include a person for setup?",
+        "I need a new phone",
+    ):
+        route = server.handoff_route(text)
+        check(f"handoff_route not a person request {text!r} -> no handoff",
+              route is None, f"{route!r}")
+
     # A name beats a department: the caller asked for a person, and that
     # person's extension is the one that reaches them.
     route = server.handoff_route("I need Ed in accounts payable")

@@ -2326,9 +2326,27 @@ NAME_GIVE_UP_NOTE = (
 
 # The caller asks for a person ("representative", "agent", "a real person").
 # Matching this hands the call to the store instead of answering.
+#
+# Both word orders count. Only the verb-first form ("Can I speak to a person?")
+# was matched at first, so the equally common noun-first form slipped through:
+# on CA963af2 the caller asked "Is there a person I can speak to now?" and was
+# offered a callback instead of being connected. "speak with" is the same
+# request as "speak to", and a bare "I need a person" is the same request
+# again. The bare form is negatable ("I don't need a person"), so it is.
 HANDOFF_RE = re.compile(
-    r"\b(representative|agent|human|operator|real person|live person|"
-    r"talk to (a |an )?person|speak to (a |an )?(person|someone)|someone real)\b",
+    r"\b(?:representative|agent|human|operator|someone real|real person|live person)\b"
+    # verb-first: "speak to a person", "talk with someone"
+    r"|\b(?:speak|talk)\s+(?:to|with)\s+(?:a\s+|an\s+)?"
+    r"(?:person|someone|somebody|anyone|anybody)\b"
+    # noun-first: "a person I can speak to", "someone we could talk with"
+    r"|\b(?:person|someone|somebody|anyone|anybody)\s+(?:that\s+)?(?:i|we)\s+"
+    r"(?:can|could|may|might|would)\s+(?:speak|talk)\s+(?:to|with)\b"
+    # noun + infinitive: "a person to speak to", "someone available to talk to"
+    r"|\b(?:person|someone|somebody|anyone|anybody)\s+(?:available\s+)?"
+    r"to\s+(?:speak|talk)\s+(?:to|with)\b"
+    # bare request: "I need a person", "can I get a person on the line"
+    r"|\b(?<!n't )(?<!not )(?:need|want|get)\s+(?:a\s+|an\s+)?"
+    r"(?:real\s+|live\s+)?person(?!'s)\b",
     re.IGNORECASE,
 )
 
