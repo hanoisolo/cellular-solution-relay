@@ -2873,6 +2873,374 @@ async def check_website_fallback_rotation_ws():
     )
 
 
+async def check_website_ask_guard_ws():
+    """End-to-end: a caller who asks for the address gets it again.
+
+    On CA957d62 the caller asked four times in 40 seconds — "can you help me
+    check my eligibility online?", "Please visit visit where?", "No. You said
+    please visit" — and every one missed WEBSITE_ASK_RE, so the guard replaced
+    the address with a callback offer and the caller hung up without it.
+
+    The mock returns the SAME directions each time, so the reply is a repeat
+    and only the ask exemption can let it through. The exemption is capped at
+    one consecutive use, so the third ask is replaced — that is the loop guard
+    still doing its job.
+    """
+    from server import WEBSITE_REPEAT_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000061"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref",
+                    "last": True,
+                }
+            )
+        )
+        first = await _collect_reply(ws)
+        assert "cellular solution dot c a" in first, (
+            f"the first website mention was not spoken: {first!r}"
+        )
+        # The live wording, plus the mock trigger. Deliberately NOT a
+        # punctuated question: "No. You said please visit" is the turn that
+        # missed the ask list on the live call, and it is also not
+        # _caller_asked, so only the ask exemption can let the repeat through.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No. You said please visit siteref",
+                    "last": True,
+                }
+            )
+        )
+        second = await _collect_reply(ws)
+        assert "cellular solution dot c a" in second, (
+            f"a caller who asked for the address was blocked: {second!r}"
+        )
+        assert not any(f in second for f in WEBSITE_REPEAT_FALLBACKS), (
+            f"the address was replaced with a fallback: {second!r}"
+        )
+        # A third and fourth consecutive ask: the exemption allows
+        # WEBSITE_ASK_MAX (2) consecutive uses, so the third still gets the
+        # address and the fourth is capped and the loop guard takes over.
+        for n in (3, 4):
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "prompt",
+                        "voicePrompt": "No. You said please visit siteref",
+                        "last": True,
+                    }
+                )
+            )
+            spoken = await _collect_reply(ws)
+            if n == 3:
+                assert "cellular solution dot c a" in spoken, (
+                    f"the second allowed ask was blocked: {spoken!r}"
+                )
+            else:
+                assert "cellular solution dot c a" not in spoken, (
+                    f"the ask exemption was not capped at {2} consecutive "
+                    f"uses: {spoken!r}"
+                )
+        # A turn that does NOT ask for the address clears the allowance, so the
+        # next ask is answered again. The count persists across turns on
+        # purpose: clearing it every turn made the cap unreachable, because a
+        # turn can only spend one use.
+        await ws.send(
+            json.dumps(
+                {"type": "prompt", "voicePrompt": "okay", "last": True}
+            )
+        )
+        await _collect_reply(ws)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No. You said please visit siteref",
+                    "last": True,
+                }
+            )
+        )
+        after_reset = await _collect_reply(ws)
+        assert "cellular solution dot c a" in after_reset, (
+            f"a non-ask turn did not clear the allowance: {after_reset!r}"
+        )
+    print(
+        "WEBSITE ASK GUARD WS: pass — a caller who asks for the address gets it, "
+        "capped at two consecutive repeats"
+    )
+
+
+async def check_website_ask_cap_ws():
+    """End-to-end: the ask allowance is CONSECUTIVE, not per-turn.
+
+    The count used to be cleared at the start of every turn, so a punctuated
+    question — which is allowed on its own merits and does not spend the
+    allowance — reset it. A model looping the directions could then be fed an
+    unlimited number of unpunctuated asks. The count now persists and is
+    cleared only by a turn that does not ask for the address, so two
+    unpunctuated asks with a punctuated one between them still spend it.
+    """
+    from server import WEBSITE_REPEAT_FALLBACKS, REPEAT_FALLBACKS  # noqa: E402
+
+    setup = dict(SETUP)
+    setup["callSid"] = "CAtest0000000000000000000000000065"
+    setup["direction"] = "inbound"
+    async with websockets.connect(WS_URL, max_size=2**20) as ws:
+        await ws.send(json.dumps(setup))
+        await asyncio.sleep(0.5)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Tell me about siteref",
+                    "last": True,
+                }
+            )
+        )
+        first = await _collect_reply(ws)
+        assert "cellular solution dot c a" in first, (
+            f"the first website mention was not spoken: {first!r}"
+        )
+        # Two unpunctuated asks with a punctuated question between them. The
+        # punctuated turn is allowed by _caller_asked and must NOT clear the
+        # allowance.
+        for prompt, label in (
+            ("No. You said please visit siteref", "first unpunctuated ask"),
+            ("Where is it? siteref", "punctuated question"),
+            ("No. You said please visit siteref", "second unpunctuated ask"),
+        ):
+            await ws.send(
+                json.dumps(
+                    {"type": "prompt", "voicePrompt": prompt, "last": True}
+                )
+            )
+            spoken = await _collect_reply(ws)
+            assert "cellular solution dot c a" in spoken, (
+                f"the address was blocked on the {label}: {spoken!r}"
+            )
+        # The allowance is now spent, so a third unpunctuated ask is capped.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "No. You said please visit siteref",
+                    "last": True,
+                }
+            )
+        )
+        capped = await _collect_reply(ws)
+        assert "cellular solution dot c a" not in capped, (
+            f"a punctuated question reset the ask allowance: {capped!r}"
+        )
+        assert any(
+            f in capped
+            for f in WEBSITE_REPEAT_FALLBACKS + REPEAT_FALLBACKS
+        ), f"the capped reply was not a fallback: {capped!r}"
+    print(
+        "WEBSITE ASK CAP WS: pass — a punctuated question does not reset the "
+        "ask allowance"
+    )
+
+
+def _start_offers_server(port, offers):
+    """Start a MOCK_LLM server with an offers block configured.
+
+    The price guard is data-driven — with no offers block there is no figure to
+    quote — so the shared mock server cannot exercise it. Returns the Popen;
+    the caller terminates it.
+    """
+    import subprocess
+    import time
+    import urllib.request
+
+    env = dict(os.environ)
+    env["MOCK_LLM"] = "1"
+    env["PORT"] = str(port)
+    env["RELAY_EPP_HARDWARE_OFFERS"] = offers
+    here = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.Popen(
+        [sys.executable, "server.py"],
+        cwd=here,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://localhost:{port}/health", timeout=1
+            ) as r:
+                if r.status == 200:
+                    return proc
+        except Exception:
+            time.sleep(0.2)
+    proc.terminate()
+    raise AssertionError(f"offers server did not start on port {port}")
+
+
+async def check_known_price_guard_ws():
+    """End-to-end: a device the offers block prices is quoted, not deflected.
+
+    On CA957d62 the caller asked "what's the price for the iPhone 16?" and was
+    told "The store will confirm the exact price for you" while the grid
+    carried $29.38. deflects_price_question stays quiet when a device is named,
+    so nothing answered it. Both enforcement points are exercised: the
+    pre-speech hold (knownref) and the chunk scan (knownref_late).
+    """
+    offers = (
+        "HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+        "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo with tax"
+    )
+    port = 8031
+    proc = _start_offers_server(port, offers)
+    url = f"ws://localhost:{port}/ws"
+    try:
+        for sid, prompt, label in (
+            (
+                "CAtest0000000000000000000000000062",
+                "what's the price for the iPhone 16? knownref",
+                "held by the pre-speech gate",
+            ),
+            (
+                "CAtest0000000000000000000000000063",
+                "what's the price for the iPhone 16? knownref_late",
+                "caught by the chunk scan",
+            ),
+        ):
+            setup = dict(SETUP)
+            setup["callSid"] = sid
+            setup["direction"] = "inbound"
+            async with websockets.connect(url, max_size=2**20) as ws:
+                await ws.send(json.dumps(setup))
+                await asyncio.sleep(0.5)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "prompt",
+                            "voicePrompt": prompt,
+                            "last": True,
+                        }
+                    )
+                )
+                spoken = await _collect_reply(ws)
+            assert "29.38" in spoken, (
+                f"the grid price was not quoted ({label}): {spoken!r}"
+            )
+            assert "store will confirm" not in spoken.lower(), (
+                f"the deflection was spoken ({label}): {spoken!r}"
+            )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    print(
+        "KNOWN PRICE GUARD WS: pass — a priced device is quoted, not deflected"
+    )
+
+
+async def check_guard_order_ws():
+    """End-to-end: the website guard runs LAST, so a reply that both repeats
+    the directions and deflects a price the grid carries is answered with the
+    price.
+
+    The website branch flushes the part of a reply that comes BEFORE the
+    directions, so whatever it flushes must not itself be a violation. Rather
+    than keep a hand-maintained list of the other guards in step, the website
+    block sits after every other guard in both the chunk scan and the
+    end-of-stream chain: if any other guard has something to say, it has
+    already said it. This test pins that ordering — with the website block
+    first, the caller hears a callback offer instead of the $29.38 the grid
+    carries.
+    """
+    offers = (
+        "HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+        "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo with tax"
+    )
+    port = 8032
+    proc = _start_offers_server(port, offers)
+    url = f"ws://localhost:{port}/ws"
+    try:
+        for sid, trigger, label in (
+            (
+                "CAtest0000000000000000000000000064",
+                "siteofferref",
+                "held by the pre-speech gate",
+            ),
+            (
+                "CAtest0000000000000000000000000066",
+                "siteofferref_late",
+                "caught by the chunk scan",
+            ),
+        ):
+            setup = dict(SETUP)
+            setup["callSid"] = sid
+            setup["direction"] = "inbound"
+            async with websockets.connect(url, max_size=2**20) as ws:
+                await ws.send(json.dumps(setup))
+                await asyncio.sleep(0.5)
+                # First mention: the directions are spoken, so the repeat guard
+                # is armed for the next turn.
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "prompt",
+                            "voicePrompt": "Tell me about siteref",
+                            "last": True,
+                        }
+                    )
+                )
+                first = await _collect_reply(ws)
+                assert "cellular solution dot c a" in first, (
+                    f"the first website mention was not spoken: {first!r}"
+                )
+                # Now a reply that repeats the site AND deflects a priced
+                # device.
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "prompt",
+                            "voicePrompt": (
+                                f"what's the price for the iPhone 16? {trigger}"
+                            ),
+                            "last": True,
+                        }
+                    )
+                )
+                spoken = await _collect_reply(ws)
+            assert "29.38" in spoken, (
+                f"the price guard did not win over the website guard "
+                f"({label}): {spoken!r}"
+            )
+            assert "store will confirm" not in spoken.lower(), (
+                f"the deflection was spoken ({label}): {spoken!r}"
+            )
+            # The replacement must not repeat the word already on the wire. The
+            # chunk scan cuts at a sentence boundary that has already been
+            # flushed, so the lead-in ends with "The" and the price starts with
+            # "The": without the duplicate-word repair the caller hears
+            # "Sure, I can help with that. The The iPhone 16 128GB is $29.38".
+            assert "the the" not in spoken.lower(), (
+                f"the replacement repeated the word already spoken "
+                f"({label}): {spoken!r}"
+            )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    print(
+        "GUARD ORDER WS: pass — the website guard runs last, so a price "
+        "deflection is answered with the price"
+    )
+
+
 async def check_smartpay_terms_guard_ws():
     """End-to-end: unverified SmartPay terms are replaced before they are
     spoken, and a claim arriving after the commit point is caught too.
@@ -3520,6 +3888,10 @@ async def main():
     await check_website_repeat_guard_ws()
     await check_website_decline_guard_ws()
     await check_website_fallback_rotation_ws()
+    await check_website_ask_guard_ws()
+    await check_website_ask_cap_ws()
+    await check_known_price_guard_ws()
+    await check_guard_order_ws()
     await check_smartpay_terms_guard_ws()
     await check_price_deflect_guard_ws()
     await check_list_ask_guard_ws()

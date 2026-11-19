@@ -910,6 +910,274 @@ def main():
               f"Visit cellularsolution.ca or email {email}.", True, "okay"
           ) is True, "let a repeat through because it also carried the email")
 
+    # --- A caller asking for the address must GET it. On CA957d62 the caller
+    # asked four times in 40 seconds — "can you help me check my eligibility
+    # online?", "Please visit visit where?", "No. You said please visit" — and
+    # every one missed WEBSITE_ASK_RE, so the guard replaced the address with a
+    # callback offer or a non-answer and the caller hung up without it. ---
+    for ask in (
+        "Yeah, can you help me check my eligibility online?",
+        "Please visit visit where?",
+        "No. You said please visit",
+        "where do I visit",
+        "where do I go to check",
+        "where do I enter my company",
+        "can you say that again",
+        "repeat that",
+        "can you spell that",
+        "how do I check my eligibility",
+        "check my eligibility",
+        # "need to" must not block the ask: only the NEGATED form is a refusal.
+        "I need to check my eligibility",
+        "what's the address",
+        "where was that",
+        "how do I reach you?",
+        # The second audit's misses. Each one is a caller asking again for the
+        # thing just mentioned, and a miss means the address is replaced with a
+        # callback offer — the CA957d62 failure.
+        "how do I check eligibility?",
+        "how do I check if I'm eligible?",
+        "Please visit what?",
+        "Where is it?",
+        "What was that?",
+        "Where?",
+        # The third audit's misses.
+        "Where to?",
+        "Where at?",
+        "What was it?",
+        "What did you say?",
+        "You said what?",
+        "How can I check if I'm eligible?",
+        "Can you repeat?",
+    ):
+        check(f"WEBSITE_ASK_RE recognises {ask!r}",
+              server.WEBSITE_ASK_RE.search(ask) is not None,
+              "missed a request for the address")
+        check(f"repeats_website allows the address for {ask!r}",
+              server.repeats_website(site, True, ask) is False,
+              "blocked a caller who asked for the address")
+    # The narrowings. Each of these is a DIFFERENT question, and exempting it
+    # would let a wrong reply through: a location, a purchase, a price check,
+    # the knowledge base, and a refusal.
+    for ask in (
+        "What's your store address?",
+        "Can I order online?",
+        "Can I check prices online?",
+        "I already checked online, what's the iPhone 16 price?",
+        "How do I check my order status?",
+        "Where do I return a phone?",
+        "I don't need to check my eligibility",
+        "I do not need to check my eligibility",
+    ):
+        check(f"WEBSITE_ASK_RE does not treat {ask!r} as a site ask",
+              server.WEBSITE_ASK_RE.search(ask) is None,
+              "exempted a different question")
+
+    # --- A device the offers block prices must be answered with its price.
+    # On CA957d62 the caller asked "what's the price for the iPhone 16?" and
+    # was told "The store will confirm the exact price for you" while the grid
+    # carried $29.38. deflects_price_question stays quiet when a device is
+    # named, so nothing answered it. ---
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+        "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo with tax; "
+        "Apple iPhone 16 256GB SmartPay Ultra: $34.20/mo with tax; "
+        "Apple iPhone 16 Pro 256GB SmartPay Ultra: $54.00/mo with tax; "
+        "Apple iPhone 17 256GB SmartPay Ultra: $62.91/mo with tax; "
+        "Samsung Galaxy S26 128GB SmartPay Ultra: $44.00/mo with tax; "
+        "Samsung Galaxy S26 Ultra 256GB SmartPay Ultra: $58.00/mo with tax"
+    )
+    entries = server.offer_entries(os.environ["RELAY_EPP_HARDWARE_OFFERS"])
+    check("offer_entries parses every priced entry", len(entries) == 6, entries)
+    check("offer_entries strips vendor, storage and tier from the label",
+          entries[0]["label"] == "iPhone 16", entries[0])
+    check("offer_entries keeps the storage size",
+          entries[0]["storage"] == "128GB", entries[0])
+    check("offer_entries keeps the price as written",
+          entries[0]["price"] == "29.38", entries[0])
+    check("offer_entries ignores an entry with no price",
+          server.offer_entries("Apple iPhone 16 128GB SmartPay Ultra") == [],
+          "parsed an entry with no price")
+    # One match quotes it; several storage sizes of one model quote the
+    # cheapest as "starts at"; a named storage size narrows to that size.
+    check("price_answer quotes the live iPhone 16 question",
+          server.price_answer("Uh, what's the price for the iPhone 16?") == (
+              "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+          server.price_answer("Uh, what's the price for the iPhone 16?"))
+    check("price_answer narrows to a storage size the caller named",
+          server.price_answer("how much is the iPhone 16 256GB") == (
+              "The iPhone 16 256GB is $34.20 a month with tax."),
+          server.price_answer("how much is the iPhone 16 256GB"))
+    check("price_answer prefers the longest matching label",
+          server.price_answer("what's the price for the iPhone 16 Pro") == (
+              "The iPhone 16 Pro 256GB is $54.00 a month with tax."),
+          server.price_answer("what's the price for the iPhone 16 Pro"))
+    # A longer variant the grid does NOT carry must not be answered with a
+    # shorter one: that is a wrong price, not a helpful answer. The variant can
+    # follow the model, be glued to the number, or come before it.
+    for ask in (
+        "how much is the iPhone 16 Pro Max",
+        "how much is the iPhone 16, Pro Max?",
+        "how much is the Pro Max iPhone 16?",
+        "how much is the iPhone 16e",
+        "how much is the Pixel 9a",
+        "how much is the Galaxy S26 Plus",
+        # Two devices named: the relay cannot tell which one is the question.
+        "I have an iPhone 16, how much is the iPhone 18?",
+        # The second audit's wrong-device cases. The device named AFTER the
+        # price word is the one asked about, so a trailing "I have an iPhone 16"
+        # must not steal the question from the Pro Max named first.
+        "How much is the iPhone 16 Pro Max? I have an iPhone 16.",
+        # "Galaxy S25" was invisible to DEVICE_TOKEN_RE (the S is not a digit),
+        # so this looked like a question about the iPhone and was answered with
+        # the iPhone price.
+        "I have an iPhone 16, how much is the Galaxy S25?",
+        # The variant can arrive after an ordinary word.
+        "how much is the iPhone 16 in the Pro Max?",
+        "how much is the iPhone 16 e?",
+        # The third audit's wrong-device cases.
+        # A model with no generation number was invisible to DEVICE_TOKEN_RE,
+        # so this looked like a question about the iPhone 16.
+        "I have an iPhone 16. How much is the iPhone Air?",
+        # A plan question is not a device question.
+        "I have an iPhone 16. How much are the plans?",
+        # The variant can sit further back in the phrase.
+        "How much is the Pro version of the iPhone 16?",
+        # "5G" immediately after the model IS a variant the grid does not carry.
+        "how much is the Galaxy S25 5G?",
+    ):
+        check(f"price_answer refuses to guess at {ask!r}",
+              server.price_answer(ask) is None, server.price_answer(ask))
+    # The other direction: a variant word that is ordinary English must NOT
+    # block the answer. Refusing these puts the caller back on the deflection
+    # this guard exists to remove.
+    for ask, want in (
+        ("What's the price for the iPhone 16 plus tax?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        ("What's the max price for the iPhone 16?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        ("5G iPhone 16 price?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        ("how much is the iPhone 16 a month?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        # "5G" after the model but not adjacent is a network descriptor.
+        ("What's the price for the iPhone 16 on a 5G plan?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        # "plus" as a preposition.
+        ("How much is the iPhone 16 plus a plan?",
+         "The iPhone 16 starts at $29.38 a month with tax for the 128GB."),
+        # "e.g." must not read as the iPhone 16e.
+        ("How much is the iPhone 16, e.g. 128GB?",
+         "The iPhone 16 128GB is $29.38 a month with tax."),
+        # A size named BEFORE the device is not the size asked about.
+        ("I have 256GB now, how much is the iPhone 16 128GB?",
+         "The iPhone 16 128GB is $29.38 a month with tax."),
+        # The caller corrected themselves in the second question.
+        ("How much is the iPhone 16? Wait, no, what's the price for the "
+         "iPhone 16 Pro?",
+         "The iPhone 16 Pro 256GB is $54.00 a month with tax."),
+    ):
+        check(f"price_answer still answers {ask!r}",
+              server.price_answer(ask) == want, server.price_answer(ask))
+    for ask in (
+        "how much is the iPhone",          # no generation named
+        "how much are the plans",          # not a device
+        "do you have a store in Mississauga",
+    ):
+        check(f"price_answer stays quiet on {ask!r}",
+              server.price_answer(ask) is None, server.price_answer(ask))
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    check("price_answer returns None with no offers configured",
+          server.price_answer("what's the price for the iPhone 16") is None,
+          "quoted a price from nothing")
+
+    # The guard itself, against the live wording.
+    os.environ["RELAY_EPP_HARDWARE_OFFERS"] = (
+        "HARDWARE OFFERS (Bell EPP, as of 2026-11-10) — Ontario (ON): "
+        "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo with tax"
+    )
+    live_known_ask = "Uh, what's the price for the iPhone 16?"
+    live_known_deflect = (
+        "The store will confirm the exact price for you. Would you like a "
+        "callback from the store to go over the current EPP pricing for the "
+        "iPhone 16?"
+    )
+    check("deflects_known_price fires on the live reply",
+          server.deflects_known_price(live_known_deflect, live_known_ask) is True,
+          "not flagged")
+    check("deflects_known_price stays quiet on a real answer",
+          server.deflects_known_price(
+              "The iPhone 16 128GB is $29.38 a month with tax.", live_known_ask)
+          is False, "flagged a real answer")
+    check("deflects_known_price needs a price ask",
+          server.deflects_known_price(live_known_deflect, "hello") is False,
+          "fired without a price ask")
+    check("deflects_known_price stays quiet on a device the grid lacks",
+          server.deflects_known_price(
+              live_known_deflect, "what's the price for the iPhone 18 Pro")
+          is False, "fired on a device the grid does not price")
+    check("_gate_commits holds a known-price deflection",
+          server._gate_commits(live_known_deflect, (), False, live_known_ask)
+          is False, "committed a deflection of a priced device")
+    check("_known_price_at fires after the commit point",
+          server._known_price_at(
+              "Sure, I can help with that. ",
+              "The store will confirm the exact price", live_known_ask)
+          is not None, "did not fire")
+    check("_known_price_at needs a price ask",
+          server._known_price_at(
+              "", "The store will confirm the exact price", "hello") is None,
+          "fired without a price ask")
+    os.environ.pop("RELAY_EPP_HARDWARE_OFFERS", None)
+    # The guard is data-driven: with no offers block there is no price to
+    # quote, so the deflection is left alone rather than replaced with a
+    # figure the relay cannot source.
+    check("_gate_commits leaves the deflection alone with no offers",
+          server._gate_commits(live_known_deflect, (), False, live_known_ask)
+          is True, "held a deflection with no price to offer instead")
+
+    # --- The website cut backs up to the SENTENCE start, so a useful opener is
+    # not thrown away with the repeat. On CA957d62 the caller asked "can I talk
+    # to you?" and the model answered "Yes, I can help right now. Please visit
+    # ..." — replacing the whole reply meant the caller never heard the yes. ---
+    check("_website_at backs up to the sentence start",
+          server._website_at(
+              "", "Yes, I can help right now. Please visit cellularsolution.ca",
+              True) == len("Yes, I can help right now. "),
+          server._website_at(
+              "", "Yes, I can help right now. Please visit cellularsolution.ca",
+              True))
+    check("_website_at drops a lead-in with no sentence boundary",
+          server._website_at("", "Please visit cellularsolution.ca", True) == 0,
+          "kept a dangling lead-in")
+    # A site that straddles the flush boundary is still caught: part of it is
+    # already spoken, so the rest of the buffer is dropped.
+    check("_website_at catches a site straddling the flush boundary",
+          server._website_at(
+              "Sure, I can help. Visit cellular", "solution dot c a and click",
+              True) == 0, "missed a straddling site")
+    check("_website_at leaves pending text alone once the site is spoken",
+          server._website_at(
+              "Visit cellularsolution.ca and click Employee Offers. ",
+              "Would you like a callback?", True) is None,
+          "fired on text after an already-spoken site")
+    # The prefix the website branch flushes must not itself be a violation:
+    # "The store will confirm the exact price for you. Visit ..." would speak
+    # the deflection the price guards exist to replace.
+    check("_prefix_is_safe allows a useful opener",
+          server._prefix_is_safe("Yes, I can help right now. ") is True,
+          "blocked a clean opener")
+    check("_prefix_is_safe rejects an empty prefix",
+          server._prefix_is_safe("   ") is False, "allowed an empty prefix")
+    check("_prefix_is_safe rejects a leading price deflection",
+          server._prefix_is_safe(
+              "The store will confirm the exact price for you. ",
+              "Take on an extra, uh, what's the price for the, um,") is False,
+          "allowed a deflection to be spoken as a prefix")
+    check("_prefix_is_safe rejects a leading invented price",
+          server._prefix_is_safe("Plans start at $35 a month. ") is False,
+          "allowed an invented figure to be spoken as a prefix")
+
     # --- Chunking. On CA17596d the caller heard a glitch on the word "visit".
     # Two causes, both in _split_holdback: the split landed on a bare character
     # offset so "visit" went out as "v" + "isit" (a lone "v" is read as "vee"),
@@ -1071,9 +1339,22 @@ def main():
         "EPP",
         "iPhone",
         "Neelam",
+        # A lone question word with a question mark is a question, not STT
+        # noise: "Where?" is a caller asking where to go, and answering it with
+        # "Sorry, I only caught part of that" is a non-answer.
+        "Where?",
+        "What?",
+        "How?",
+        # A question word plus a preposition is still a question.
+        "Where to?",
+        "Where at?",
     ):
         check(f"is_fragment({real!r}) -> False",
               server.is_fragment(real) is False, "treated as a fragment")
+    # Without the question mark it is still a clipped line.
+    for fragment in ("What.", "Where.", "How."):
+        check(f"is_fragment({fragment!r}) -> True",
+              server.is_fragment(fragment) is True, "not a fragment")
     for prompt in server.FRAGMENT_PROMPTS:
         check("fragment prompt is an open turn", "?" in prompt, prompt)
         check("fragment prompt is not a sign-off",
@@ -1233,6 +1514,35 @@ def main():
                            "Bell's Employee Purchase Program gives up to 30 "
                            "percent off mobility plans with no activation fees.")
           is False, "unrelated replies flagged")
+
+    # --- repeat_allowed(): the history-level backstop must agree with the
+    # pre-speech gate. It used to exempt only a closing and an answer to a real
+    # question, so a caller who asked for the address in an UNPUNCTUATED turn
+    # ("No. You said please visit") had the address the gate had just allowed
+    # rewritten to a fallback in history — the model's next turn then saw a
+    # reply it had never given. ---
+    site_reply = (
+        "You can look up your company at cellular solution dot c a under "
+        "Employee Offers."
+    )
+    check("repeat_allowed: a sign-off is not a loop",
+          server.repeat_allowed("Goodbye.", "okay") is True, "blocked a closing")
+    check("repeat_allowed: an answer to a real question is not a loop",
+          server.repeat_allowed(long_q, "what's the call about?") is True,
+          "blocked an answer")
+    check("repeat_allowed: an unpunctuated ask for the address is not a loop",
+          server.repeat_allowed(site_reply, "No. You said please visit") is True,
+          "rewrote the address the gate had allowed")
+    check("repeat_allowed: a repeat nobody asked for is still a loop",
+          server.repeat_allowed(site_reply, "okay") is False,
+          "let an unasked repeat through")
+    check("repeat_allowed: a pitch repeat is still a loop",
+          server.repeat_allowed(
+              "Bell's Employee Purchase Program gives employees of select "
+              "partner companies up to 30 percent off Bell mobility plans and "
+              "no activation fees.",
+              "what's the call about?",
+          ) is False, "let a pitch repeat through")
 
     # --- A closing ends the call: the relay sends action "close" and /handoff
     # must hang up, not dial. Dialling would put a caller who just said goodbye

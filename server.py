@@ -530,6 +530,10 @@ def _gate_commits(
     # question, not a deflection, so hold the deflection from its first words.
     if deflects_price_question(t, user_text):
         return False
+    # A device the grid prices must be answered with its price, not a
+    # deflection, so hold that the same way.
+    if deflects_known_price(t, user_text):
+        return False
     # A caller who asked to see everything in a line must not be answered with
     # a narrowing question, so hold that too.
     if LIST_ASK_RE.search(user_text or "") and NARROW_RE.search(t):
@@ -548,6 +552,33 @@ def _gate_commits(
 
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _prefix_is_safe(text: str, user_text: str = "") -> bool:
+    """True when a reply prefix can be spoken on its own.
+
+    The website branch flushes the part of a reply that comes BEFORE the
+    directions, so a useful opener ("Yes, I can help right now.") is not lost
+    with the repeat. But that prefix can itself be a violation — "The store
+    will confirm the exact price for you. Visit cellularsolution.ca" would
+    speak the very deflection the price guards exist to replace — so it is
+    checked against every other guard before it is spoken.
+    """
+    t = text or ""
+    if not t.strip():
+        return False
+    return not (
+        FORBIDDEN_QUESTION_RE.search(t)
+        or claims_staff_availability(t)
+        or TRANSFER_DENIAL_RE.search(t)
+        or TRANSFER_PROMISE_RE.search(t)
+        or invented_price(t)
+        or claims_smartpay_terms(t)
+        or persona_break(t)
+        or deflects_price_question(t, user_text)
+        or deflects_known_price(t, user_text)
+        or (LIST_ASK_RE.search(user_text or "") and NARROW_RE.search(t))
+    )
 
 
 def _forbidden_at(spoken: str, pending: str) -> int | None:
@@ -756,8 +787,63 @@ WEBSITE_RE = re.compile(
 )
 # "email" belongs here for the same reason: a caller asking for the address is
 # asking for something the agent may repeat freely.
+#
+# This list was too narrow, and it cost a whole call. On CA957d62 the caller
+# asked for the address four times in 40 seconds — "can you help me check my
+# eligibility online?", "Please visit visit where?", "No. You said please
+# visit" — and every one of them missed, so the guard replaced the address
+# with a callback offer or a non-answer and the caller hung up without it.
+# A miss here means the caller NEVER gets the address, so the bias is toward
+# matching: a false match only repeats the site to someone who did not ask.
+# The narrowings below are the ones that would otherwise exempt a genuinely
+# different question — "What's your store address?" is a location, "Can I
+# order online?" is a purchase, "How do I check my order status?" is the
+# knowledge base, and "I don't need to check my eligibility" is a refusal.
 WEBSITE_ASK_RE = re.compile(
-    r"\b(?:website|web site|site|url|link|e-?mail)\b", re.IGNORECASE
+    # The site itself, by any name the caller might use. "address" is matched
+    # only when it is not a location: "What's your store address?" is the
+    # Vaughan store, not the website.
+    r"\b(?:website|web site|site|url|link|e-?mail)\b"
+    r"|(?<!store )(?<!street )(?<!mailing )(?<!billing )\baddress\b"
+    # "check my eligibility online" — the eligibility check IS the website
+    # flow. Scoped to that context so "can I check prices online?" is not
+    # exempted.
+    r"|\b(?:eligib\w*|check\w*\s+(?:my|your|the|if|whether))\b[^.]{0,30}"
+    r"\bonline\b"
+    r"|\bonline\b[^.]{0,30}\b(?:eligib\w*|check\w*)\b"
+    # "visit where?", "visit what?", "where do I visit", "where was that"
+    r"|\b(?:visit|go|check|look|find|see|type|enter)\w*\s+(?:where|what)\b"
+    r"|\bwhere\s+(?:do\s+i|can\s+i|should\s+i|would\s+i|to)\s+"
+    r"(?:visit|go|check|look|find|see|type|enter)\b"
+    r"|\bwhere\s+(?:was\s+that|is\s+that|again)\b"
+    # "Where is it?", "What was that?" — the caller asking again for the thing
+    # just mentioned. A bare "Where?" counts too: it is a question, and a false
+    # match only repeats the site to someone who did not ask.
+    r"|\bwhere\s+(?:is|was)\s+(?:it|that|this)\b"
+    r"|\bwhat\s+(?:was|is)\s+(?:that|it|this)\b"
+    r"|\bwhat\s+did\s+you\s+say\b"
+    r"|\bwhere\s+(?:to|at)\b"
+    r"|\bwhere\s*\?"
+    # "Can you repeat?", "How can I check if I'm eligible?"
+    r"|\b(?:can|could|would)\s+you\s+repeat\b"
+    r"|\bhow\s+(?:do|can|could|should)\s+i\s+(?:check|see|find|verify|look)\b"
+    r"[^.]{0,30}\b(?:eligib\w*|online|site|website|link|url)\b"
+    # "you said please visit", "you mentioned a link", "you said what?"
+    r"|\byou\s+(?:said|mentioned|told\s+me)\b[^.]{0,24}"
+    r"\b(?:visit|site|link|address|online|where|check|what)\b"
+    # "say that again", "repeat that", "can you spell that"
+    r"|\b(?:say|repeat|tell\s+me)\s+(?:that|it)\s+again\b"
+    r"|\brepeat\s+(?:that|it)\b"
+    r"|\bspell\s+(?:that|it|the\s+(?:site|address|url|link))\b"
+    # "how do I check my eligibility", "how do I reach you"
+    r"|\bhow\s+do\s+i\s+(?:check|see|find|verify|look)\b[^.]{0,30}"
+    r"\b(?:eligib\w*|online|site|website|link|url)\b"
+    r"|\bhow\s+do\s+i\s+(?:reach|contact)\b"
+    # "check my eligibility" — but not "I don't need to check my eligibility".
+    # Three fixed-width lookbehinds, because a lookbehind cannot be variable.
+    r"|(?<!don't need to )(?<!dont need to )(?<!do not need to )"
+    r"\bcheck\s+(?:my|your|the)\s+eligibility\b",
+    re.IGNORECASE,
 )
 
 # A reply that could be heading toward the website directions. The gate commits
@@ -787,6 +873,12 @@ WEBSITE_REPEAT_NO_CALLBACK = (
     "Is there anything else about the plans I can explain?",
     "What else can I help you with today?",
 )
+
+# How many consecutive turns may have a repeat allowed because the caller asked
+# for the address. Two covers "what's the website?" then "no, you said please
+# visit" — a real sequence on CA957d62 — while still stopping a model that
+# re-emits the directions turn after turn.
+WEBSITE_ASK_MAX = 2
 
 
 def website_repeat_fallback(
@@ -909,6 +1001,23 @@ def deflects_price_question(reply: str, user_text: str = "") -> bool:
     if DEVICE_NAMED_RE.search(t):
         return False
     return bool(PRICE_DEFLECT_RE.search(t))
+
+
+def deflects_known_price(reply: str, user_text: str = "") -> bool:
+    """True when a price question about a device the grid prices was answered
+    with a deflection instead of the price.
+
+    deflects_price_question deliberately stays quiet when the caller named a
+    device, so a genuine "that model isn't in my list" is left alone. But when
+    the device IS in the grid a deflection is simply wrong: on CA957d62 the
+    caller asked "what's the price for the iPhone 16?" and was told "The store
+    will confirm the exact price for you" while the grid carried $29.38.
+    """
+    if not PRICE_ASK_RE.search(user_text or ""):
+        return False
+    if not price_answer(user_text):
+        return False
+    return bool(PRICE_DEFLECT_RE.search(reply or ""))
 
 
 # A caller asking to see everything in a line ("all the iPhones", "what phones
@@ -1039,6 +1148,211 @@ def list_reply(user_text: str) -> str | None:
     )
 
 
+# One priced entry of a VERIFIED HARDWARE OFFERS block, in the format
+# demo/epp_grid.py emits: "Apple iPhone 16 128GB SmartPay Ultra: $29.38/mo
+# with tax". Entries are separated by "; ".
+OFFER_PRICE_RE = re.compile(
+    r"^(?P<name>.+?)\s*:\s*\$(?P<price>\d+(?:\.\d{1,2})?)\s*/\s*mo\b",
+    re.IGNORECASE,
+)
+STORAGE_RE = re.compile(r"\b\d+\s?(?:GB|TB)\b", re.IGNORECASE)
+SMARTPAY_TIER_RE = re.compile(r"\bSmartPay\s+\w+\b", re.IGNORECASE)
+# A model variant the grid may or may not carry. Used to refuse a guess: when
+# the caller names a longer variant than any label we have, quoting the
+# shorter one is a wrong price, not a helpful answer.
+#
+# Two words are ordinary English as well as model names, so each carries its
+# own guard. "plus" is a preposition — "iPhone 16 plus tax", "plus a plan" —
+# and "e" is the first letter of "e.g.". Refusing those puts the caller back on
+# the deflection this guard exists to remove, so the guard is narrow and the
+# sentence scan below does the rest.
+MODEL_SUFFIX_RE = re.compile(
+    r"\b(?:pro|max|ultra|mini|fe|air|duo|se|fold|flip|edge|note|lite|xl)\b"
+    r"|\bplus\b(?!\s+(?:tax|taxes|hst|gst|pst|fees?|shipping|activation"
+    r"|deposit|a|an|the|my|your|with|and|or|for|on|in|at|to|of)\b)"
+    r"|\be\b(?!\.)",
+    re.IGNORECASE,
+)
+# "5G" is a variant only when it sits immediately after the model name
+# ("Galaxy A54 5G"). Anywhere else it is a network descriptor: "the iPhone 16
+# on a 5G plan" is a question about the plain 16.
+MODEL_5G_RE = re.compile(r"\s*5g\b", re.IGNORECASE)
+# The same words, but only when one sits IMMEDIATELY before the model name
+# ("Pro Max iPhone 16"). "5G" is excluded here: before a model name it is a
+# network descriptor ("5G iPhone 16 price?"), not a variant.
+HEAD_VARIANT_RE = re.compile(
+    r"(?:pro|max|plus|ultra|mini|fe|air|duo|se|fold|flip|edge|note|lite|xl)",
+    re.IGNORECASE,
+)
+# A variant word anywhere in the words BEFORE the model name, unless it is
+# followed by a price word — "the max price for the iPhone 16" is a question
+# about the plain 16, while "the Pro version of the iPhone 16" is not.
+HEAD_VARIANT_SCAN_RE = re.compile(
+    r"\b(?:pro|max|plus|ultra|mini|fe|air|duo|se|fold|flip|edge|note|lite|xl)\b"
+    r"(?!\s+(?:price|prices|pricing|cost|costs|much|tax|taxes|fees?"
+    r"|monthly|a month)\b)",
+    re.IGNORECASE,
+)
+# A device named in the caller's turn, brand plus generation. The optional
+# letter covers "Galaxy S25" and "Pixel 9a"; without it the S25 was invisible,
+# so "I have an iPhone 16, how much is the Galaxy S25?" looked like a question
+# about the iPhone and was answered with the iPhone price. The word list
+# covers a model with no generation number ("iPhone Air"), which was invisible
+# for the same reason.
+DEVICE_TOKEN_RE = re.compile(
+    r"\b(?:iphone|pixel|galaxy|ahlo)\s+"
+    r"(?:[a-z]?\d+\w*|air|mini|plus|pro|max|ultra|fe|se|fold|flip|note|edge"
+    r"|lite)\b",
+    re.IGNORECASE,
+)
+
+
+def offer_entries(offers: str) -> list[dict]:
+    """Every priced entry in a VERIFIED HARDWARE OFFERS block.
+
+    `label` is the model identity a caller would say — the vendor prefix,
+    storage size and SmartPay tier stripped off — so "Apple iPhone 16 128GB
+    SmartPay Ultra" becomes "iPhone 16". `key` is that label lowercased for
+    matching; `storage` and `price` are kept as written.
+    """
+    out: list[dict] = []
+    for entry in (offers or "").split(";"):
+        m = OFFER_PRICE_RE.match(entry.strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if ":" in name:
+            # A header line that ran into the first entry.
+            name = name.rsplit(":", 1)[1].strip()
+        storage_m = STORAGE_RE.search(name)
+        label = VENDOR_PREFIX_RE.sub("", name)
+        label = STORAGE_RE.sub(" ", label)
+        label = SMARTPAY_TIER_RE.sub(" ", label)
+        label = re.sub(r"\s+", " ", label).strip()
+        if not label:
+            continue
+        out.append(
+            {
+                "label": label,
+                "key": label.lower(),
+                "storage": storage_m.group() if storage_m else "",
+                "price": m.group("price"),
+            }
+        )
+    return out
+
+
+def price_answer(user_text: str) -> str | None:
+    """Quote the grid price for a device the caller named, or None.
+
+    The offers block is the only source of a figure the relay may speak, so
+    this answers from it and nothing else. Returns None when no device is
+    named, when the named device is not in the grid, when the caller named a
+    longer variant than the grid carries, or when no offers are configured —
+    the caller then falls through to the existing deflection handling.
+
+    On CA957d62 the caller asked "what's the price for the iPhone 16?" and was
+    told "The store will confirm the exact price for you" while the grid
+    carried $29.38. deflects_price_question deliberately stays quiet when a
+    device is named, so nothing answered it.
+    """
+    entries = offer_entries(_env_or("RELAY_EPP_HARDWARE_OFFERS", EPP_HARDWARE_OFFERS))
+    if not entries:
+        return None
+    asked = _norm_text(user_text)
+    if not asked:
+        return None
+    # A caller who names two devices is asking about one of them and the relay
+    # cannot tell which, so it does not guess.
+    if len({m.group(0).lower() for m in DEVICE_TOKEN_RE.finditer(asked)}) > 1:
+        return None
+    keys = {e["key"] for e in entries if e["key"] and e["key"] in asked}
+    if not keys:
+        return None
+    # Which device the question is about. The one named AFTER the LAST price
+    # word wins — "I have an iPhone 16, how much is the iPhone 18?" is about the
+    # 18, and "How much is the iPhone 16? Wait, no, what's the price for the
+    # iPhone 16 Pro?" is about the Pro, because the caller corrected themselves
+    # in the second question. When every device is named before it, the last one
+    # does. The longest label wins a tie, so "iPhone 16 Pro Max" is not read as
+    # the plain iPhone 16 that happens to be a prefix of it.
+    ask_pos = 0
+    for ask_m in PRICE_ASK_RE.finditer(asked):
+        ask_pos = ask_m.start()
+    after = [
+        (asked.find(k, ask_pos), k) for k in keys if asked.find(k, ask_pos) != -1
+    ]
+    if after:
+        key = min(after, key=lambda t: (t[0], -len(t[1])))[1]
+        named_after_ask = True
+    else:
+        key = max(
+            ((asked.rfind(k), k) for k in keys),
+            key=lambda t: (t[0], len(t[1])),
+        )[1]
+        named_after_ask = False
+    # "I have an iPhone 16. How much are the plans?" is a question about the
+    # plans, not about the phone the caller already owns.
+    if not named_after_ask and PLAN_ASK_RE.search(asked):
+        return None
+    idx = asked.find(key, ask_pos)
+    if idx == -1:
+        idx = asked.rfind(key)
+    tail = asked[idx + len(key) :]
+    # "iPhone 16e" / "Pixel 9a": a letter glued to the number is a different
+    # model, not the one the grid carries.
+    if tail and tail[0].isalnum():
+        return None
+    # "iPhone 16 Pro Max" / "iPhone 16, Pro Max" / "iPhone 16 in the Pro Max":
+    # a longer variant the grid does NOT carry must not be answered with the
+    # shorter one either. Only the sentence the device is named in counts, so a
+    # variant mentioned in a later sentence does not block the answer. The split
+    # needs whitespace after the punctuation, or "e.g." becomes "e" and reads as
+    # the iPhone 16e.
+    if MODEL_SUFFIX_RE.search(
+        re.split(r"(?<=[.?!])\s+", tail, maxsplit=1)[0]
+    ):
+        return None
+    # "Galaxy A54 5G" is a variant; "the iPhone 16 on a 5G plan" is not.
+    if MODEL_5G_RE.match(tail):
+        return None
+    # "Pro Max iPhone 16": the variant can come before the model too, but only
+    # when it sits immediately before it — "the max price for the iPhone 16" is
+    # a question about the plain 16.
+    head_words = asked[:idx].split()
+    if head_words and HEAD_VARIANT_RE.fullmatch(head_words[-1]):
+        return None
+    # "the Pro version of the iPhone 16" — a variant further back in the same
+    # phrase, unless it is followed by a price word ("the max price for the").
+    if HEAD_VARIANT_SCAN_RE.search(asked[max(0, idx - 40) : idx]):
+        return None
+    matches = [e for e in entries if e["key"] == key]
+    # A storage size the caller named narrows the answer to that size, so
+    # "iPhone 16 256GB" is quoted rather than "starts at" the 128GB price. Only
+    # a size named AFTER the device counts: "I have 256GB now, how much is the
+    # iPhone 16 128GB?" is a question about the 128GB.
+    want = STORAGE_RE.search(asked, idx + len(key)) or STORAGE_RE.search(asked)
+    if want:
+        sized = [
+            e
+            for e in matches
+            if e["storage"].replace(" ", "").lower()
+            == want.group().replace(" ", "").lower()
+        ]
+        if sized:
+            matches = sized
+    cheapest = min(matches, key=lambda e: float(e["price"]))
+    if len(matches) == 1:
+        return (
+            f"The {cheapest['label']} {cheapest['storage']} is "
+            f"${cheapest['price']} a month with tax."
+        )
+    return (
+        f"The {cheapest['label']} starts at ${cheapest['price']} a month with "
+        f"tax for the {cheapest['storage']}."
+    )
+
+
 def _amounts(text: str) -> set[str]:
     """Every dollar figure in `text`, normalized to a bare 2dp number string.
     Handles the spoken forms the model actually produces: "$62.91", "$62",
@@ -1119,6 +1433,17 @@ def is_fragment(user_text: str) -> bool:
     if not t or GREETING_ONLY_RE.match(t):
         return False
     if any(ch.isdigit() for ch in t):
+        return False
+    # A lone question word with a question mark is a real question, not STT
+    # noise: "Where?" is a caller asking where to go, and answering it with
+    # "Sorry, I only caught part of that" is a non-answer. "What." without the
+    # mark stays a fragment.
+    if re.fullmatch(
+        r"(?:where|what|when|who|why|how)"
+        r"(?:\s+(?:to|at|from|is|was|it|that|this|now|again))?\s*\?",
+        t,
+        re.IGNORECASE,
+    ):
         return False
     words = [w for w in re.split(r"[\s,.;:!?]+", t.lower()) if w]
     if not words or len(words) > FRAGMENT_MAX_WORDS:
@@ -1404,15 +1729,39 @@ def _website_at(
     Same shape as _forbidden_at: the pre-speech gate only holds a reply until
     it commits, so a second set of directions arriving after the commit point
     would stream out unfiltered.
+
+    The cut backs up to the start of the SENTENCE holding the site, the same
+    way _smartpay_terms_at and _invented_price_at do. Cutting at the site
+    itself left the lead-in already spoken: on CA957d62 the caller heard
+    "Please visit" and then a callback offer, which is worse than either half
+    alone. When there is no sentence boundary to cut at, the whole pending
+    buffer is the lead-in and is dropped.
     """
-    if not repeats_website(pending or "", website_spoken, user_text):
-        return None
-    look = 32
+    look = 160
     tail = (spoken or "")[-look:]
-    m = WEBSITE_RE.search(tail + (pending or ""))
+    window = tail + (pending or "")
+    if not repeats_website(window, website_spoken, user_text):
+        return None
+    m = WEBSITE_RE.search(window)
     if not m:
         return None
-    return max(0, m.start() - len(tail))
+    start = m.start()
+    if m.end() <= len(tail):
+        # The site is already fully spoken, so there is nothing left to
+        # replace and the pending text is legitimate.
+        return None
+    if start < len(tail):
+        # The site straddles the flush boundary: part of it is already spoken,
+        # so the rest of the buffer is dropped rather than spoken.
+        return 0
+    cut = max(
+        window.rfind(". ", 0, start),
+        window.rfind("? ", 0, start),
+        window.rfind("! ", 0, start),
+    )
+    if cut == -1:
+        return 0
+    return max(0, cut + 2 - len(tail))
 
 
 def _smartpay_terms_at(spoken: str, pending: str) -> int | None:
@@ -1529,6 +1878,26 @@ def _price_deflect_at(spoken: str, pending: str, user_text: str) -> int | None:
     return max(0, m.start() - len(tail))
 
 
+def _known_price_at(spoken: str, pending: str, user_text: str) -> int | None:
+    """Index in `pending` where a deflection of a grid-priced device starts.
+
+    Same shape as _forbidden_at. The gate holds a deflection from its first
+    words, but a reply that opens with something else ("I can help with that.
+    The store will confirm the exact price for you.") commits at four words,
+    so the deflection arrives after the commit point and would be spoken.
+    """
+    if not PRICE_ASK_RE.search(user_text or ""):
+        return None
+    if not price_answer(user_text):
+        return None
+    look = 32
+    tail = (spoken or "")[-look:]
+    m = PRICE_DEFLECT_RE.search(tail + (pending or ""))
+    if not m:
+        return None
+    return max(0, m.start() - len(tail))
+
+
 def _list_ask_at(spoken: str, pending: str, user_text: str) -> int | None:
     """Index in `pending` where a narrowing question starts, or None.
 
@@ -1579,6 +1948,35 @@ def is_repeat(prev: str, cur: str) -> bool:
     if matcher.ratio() >= REPEAT_SIMILARITY:
         return True
     return matcher.find_longest_match(0, len(p), 0, len(c)).size >= REPEAT_MIN_BLOCK
+
+
+def repeat_allowed(reply: str, user_text: str) -> bool:
+    """True when a repeated reply is an ANSWER, not a loop.
+
+    The history-level backstop replaces a repeat so the model does not see its
+    own loop on the next turn. Three cases are not loops:
+
+    * a sign-off — "Goodbye." twice is not content the caller must hear once;
+    * an answer to a real question — the post-pitch prompt tells the model what
+      to say when the caller asks what the call is about, so the same sentence
+      twice is expected;
+    * the website directions, when the caller asked for them. The pre-speech
+      gate already decided whether this turn may repeat them (capped at
+      WEBSITE_ASK_MAX consecutive uses), so the backstop must agree with it.
+      Without this the backstop rewrote the history to a fallback the caller
+      never heard, and the model's next turn saw a reply it had not given.
+
+    A pitch-like repeat is still replaced — that is the loop this guard exists
+    for.
+    """
+    r = reply or ""
+    if CLOSING_RE.search(r):
+        return True
+    if _pitch_delivered(r):
+        return False
+    if _caller_asked(user_text):
+        return True
+    return bool(WEBSITE_ASK_RE.search(user_text or "") and WEBSITE_RE.search(r))
 
 # Shared by both outbound phases. The ONLY difference between them is whether
 # the pitch script is still available: once the pitch has been spoken, the
@@ -1959,6 +2357,21 @@ MOCK_REPLIES = {
     "priceref_late": (
         "Would you like the store to call you back? Plans start at $35 a month."
     ),
+    # A deflection of a device the offers block DOES price. On CA957d62 the
+    # caller asked "what's the price for the iPhone 16?" and was told "The
+    # store will confirm the exact price for you" while the grid carried
+    # $29.38. The deflection is the FIRST sentence, so the pre-speech gate
+    # holds it. Only reachable in MOCK_LLM mode.
+    "knownref": (
+        "The store will confirm the exact price for you. Would you like a "
+        "callback from the store to go over the current EPP pricing?"
+    ),
+    # The same deflection AFTER a sentence that commits the pre-speech gate,
+    # so only the chunk scan can catch it. Only reachable in MOCK_LLM mode.
+    "knownref_late": (
+        "Sure, I can help with that. The store will confirm the exact price "
+        "for you."
+    ),
     # A persona break, so the output backstop can be exercised end-to-end. The
     # break is the FIRST sentence, so the pre-speech gate holds it. Only
     # reachable in MOCK_LLM mode.
@@ -2028,6 +2441,21 @@ MOCK_REPLIES = {
     # mode.
     "narrowref_late": (
         "I can help with that. Which iPhone model are you looking at?"
+    ),
+    # A reply that BOTH repeats the website directions and deflects a price the
+    # offers block carries. The website guard runs LAST so the price guard wins
+    # and the caller hears the price, not a callback offer. Only reachable in
+    # MOCK_LLM mode.
+    "siteofferref": (
+        "The store will confirm the exact price for you. To check eligibility, "
+        "visit cellularsolution.ca and click Employee Offers."
+    ),
+    # The same pair AFTER a sentence that commits the pre-speech gate, so only
+    # the chunk scan can catch it — which is where the guard ORDER matters.
+    # Only reachable in MOCK_LLM mode.
+    "siteofferref_late": (
+        "Sure, I can help with that. The store will confirm the exact price "
+        "for you. Visit cellularsolution.ca and click Employee Offers."
     ),
 }
 
@@ -2125,6 +2553,16 @@ def _mock_reply_for(history: list[dict]) -> str:
         return MOCK_REPLIES["priceref_late"]
     if "priceref" in lowered:
         return MOCK_REPLIES["priceref"]
+    if "knownref_late" in lowered:
+        return MOCK_REPLIES["knownref_late"]
+    if "knownref" in lowered:
+        return MOCK_REPLIES["knownref"]
+    # Must come before the generic "price" fallback below, or the trigger is
+    # swallowed and the guard-order test passes on the wrong reply.
+    if "siteofferref_late" in lowered:
+        return MOCK_REPLIES["siteofferref_late"]
+    if "siteofferref" in lowered:
+        return MOCK_REPLIES["siteofferref"]
     if "takecareref" in lowered:
         return MOCK_REPLIES["takecare"]
     if "pitchref" in lowered:
@@ -2212,6 +2650,11 @@ def new_call_state() -> dict:
         # True once the website directions have actually been spoken, so a
         # second set is replaced with the callback offer instead of repeated.
         "website_spoken": False,
+        # How many CONSECUTIVE turns have had a repeat allowed because the
+        # caller asked for the address. A caller who asks twice gets the
+        # address twice; a model that keeps re-emitting it while the caller
+        # complains is a loop, so the exemption stops at WEBSITE_ASK_MAX.
+        "website_ask_uses": 0,
     }
 
 # Voice history per call keeps only the system prompt plus the most recent
@@ -3284,6 +3727,7 @@ async def relay_ws(websocket: WebSocket) -> None:
         user_text="",
         website_spoken=False,
         callback_declined=False,
+        website_ask_uses=0,
     ) -> tuple[str, float]:
         """Stream reply tokens to Twilio with a short holdback, normalizing
         each chunk for TTS before it is spoken; return the full reply text
@@ -3364,13 +3808,23 @@ async def relay_ws(websocket: WebSocket) -> None:
             caller hears "With SmartPay" then "I can't confirm", which the voice
             engine reads as "SmartPayI can't". A leading space is a no-op when
             the last chunk already ended cleanly.
+
+            A replacement also must not repeat the word already spoken. When a
+            guard cuts at a sentence boundary that has already been flushed, the
+            lead-in is on the wire and the fallback starts with the same word:
+            "Sure, I can help with that. The " + "The iPhone 16 128GB is $29.38"
+            reads as "The The iPhone 16". Dropping the duplicate word is the
+            only repair available — the lead-in cannot be unsaid.
             """
-            if (
-                spoken_box is not None
-                and spoken_box[0]
-                and not spoken_box[0][-1].isspace()
-            ):
-                text = " " + text
+            if spoken_box is not None and spoken_box[0]:
+                spoken = spoken_box[0]
+                first, _, rest = text.strip().partition(" ")
+                if first and spoken.rstrip().lower().endswith(" " + first.lower()):
+                    text = rest
+                    if not text:
+                        return
+                if not spoken[-1].isspace():
+                    text = " " + text
             await _flush(text)
 
         async def _scan_pending(final: bool = False) -> bool:
@@ -3487,22 +3941,6 @@ async def relay_ws(websocket: WebSocket) -> None:
                 full = SMARTPAY_TERMS_FALLBACKS[0]
                 await _flush_fallback(full)
                 return True
-            site = _website_at(spoken, pending, website_spoken, user_text)
-            if site is not None:
-                # The caller has already heard the website directions. Same
-                # treatment: say the safe prefix, then the callback offer.
-                safe = pending[:site]
-                pending = ""
-                if safe:
-                    await _flush(safe)
-                log_event(
-                    "website_repeat_guard",
-                    callSid=call_sid,
-                    text=full.strip(),
-                )
-                full = website_repeat_fallback(recent_replies, callback_declined)
-                await _flush_fallback(full)
-                return True
             deflect = _price_deflect_at(spoken, pending, user_text)
             if deflect is not None:
                 # A price question that named no device is being answered with
@@ -3518,6 +3956,23 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = DEVICE_QUESTION
+                await _flush_fallback(full)
+                return True
+            known = _known_price_at(spoken, pending, user_text)
+            if known is not None:
+                # The caller named a device the grid prices and is being
+                # deflected. Say the safe prefix, then the price, and drop the
+                # rest of the stream.
+                safe = pending[:known]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "known_price_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = price_answer(user_text) or PRICE_FALLBACKS[0]
                 await _flush_fallback(full)
                 return True
             narrow = _list_ask_at(spoken, pending, user_text)
@@ -3551,6 +4006,29 @@ async def relay_ws(websocket: WebSocket) -> None:
                     text=full.strip(),
                 )
                 full = INJECTION_FALLBACKS[0]
+                await _flush_fallback(full)
+                return True
+            site = _website_at(spoken, pending, website_spoken, user_text)
+            if site is not None:
+                # The caller has already heard the website directions. Same
+                # treatment: say the safe prefix, then the callback offer.
+                #
+                # This block runs LAST on purpose. Every other guard above has
+                # already found nothing in `pending`, so the prefix flushed here
+                # cannot be a violation — which is what makes the ordering the
+                # structural fix rather than a hand-maintained list. A guard
+                # added later is covered automatically as long as it goes above
+                # this one.
+                safe = pending[:site]
+                pending = ""
+                if safe:
+                    await _flush(safe)
+                log_event(
+                    "website_repeat_guard",
+                    callSid=call_sid,
+                    text=full.strip(),
+                )
+                full = website_repeat_fallback(recent_replies, callback_declined)
                 await _flush_fallback(full)
                 return True
             emit, pending = _split_pending(pending)
@@ -3676,21 +4154,43 @@ async def relay_ws(websocket: WebSocket) -> None:
                     _norm_text(r) == _norm_text(replacement) for r in recent_replies
                 ):
                     replacement = SMARTPAY_TERMS_FALLBACKS[1]
-            elif repeats_website(gate, website_spoken, user_text):
-                log_event(
-                    "website_repeat_guard", callSid=call_sid, text=gate.strip()
-                )
-                replacement = website_repeat_fallback(
-                    recent_replies, callback_declined
-                )
             elif deflects_price_question(gate, user_text):
                 log_event(
                     "price_deflect_guard", callSid=call_sid, text=gate.strip()
                 )
                 replacement = DEVICE_QUESTION
+            elif deflects_known_price(gate, user_text):
+                log_event(
+                    "known_price_guard", callSid=call_sid, text=gate.strip()
+                )
+                replacement = price_answer(user_text) or PRICE_FALLBACKS[0]
             elif LIST_ASK_RE.search(user_text or "") and NARROW_RE.search(gate):
                 log_event("list_ask_guard", callSid=call_sid, text=gate.strip())
                 replacement = list_reply(user_text) or DEAD_END_RECOVERIES[0]
+            elif repeats_website(gate, website_spoken, user_text):
+                log_event(
+                    "website_repeat_guard", callSid=call_sid, text=gate.strip()
+                )
+                # Speak whatever comes BEFORE the directions, so a useful
+                # opener is not thrown away with the repeat. On CA957d62 the
+                # caller asked "can I talk to you?" and the model answered
+                # "Yes, I can help right now. Please visit ..." — replacing the
+                # whole reply meant the caller never heard the yes. The cut is
+                # the same sentence boundary _website_at uses, so a reply with
+                # no boundary before the site is still dropped whole.
+                #
+                # This branch sits after the price and list guards on purpose:
+                # a reply that both repeats the site and deflects a price the
+                # grid carries is answered with the price, not with a callback
+                # offer. _prefix_is_safe() is kept as a second line of defence
+                # for a guard added below this one.
+                cut = _website_at("", gate, website_spoken, user_text)
+                safe = gate[:cut] if cut else ""
+                if _prefix_is_safe(safe, user_text):
+                    await _flush(safe)
+                replacement = website_repeat_fallback(
+                    recent_replies, callback_declined
+                )
             elif repeated is not None:
                 # A repeat in answer to a clear question is an ANSWER, not a
                 # loop: the post-pitch prompt tells the model what to say when
@@ -3705,10 +4205,34 @@ async def relay_ws(websocket: WebSocket) -> None:
                     log_event(
                         "repeat_allowed_closing", callSid=call_sid, text=gate.strip()
                     )
-                elif _caller_asked(user_text) and not _pitch_delivered(gate):
+                elif (
+                    _caller_asked(user_text)
+                    # A caller who asked for the address gets it again: the
+                    # repeat IS the answer. On CA957d62 the caller said "No.
+                    # You said please visit" and the guard replaced the
+                    # address with "Let me put that another way". The reply
+                    # must really be the directions, and the exemption is
+                    # capped at WEBSITE_ASK_MAX consecutive uses, so a model
+                    # that keeps re-emitting them while the caller complains
+                    # is still caught as a loop.
+                    or (
+                        WEBSITE_ASK_RE.search(user_text or "")
+                        and WEBSITE_RE.search(gate)
+                        and website_ask_uses < WEBSITE_ASK_MAX
+                    )
+                ) and not _pitch_delivered(gate):
                     log_event(
                         "repeat_allowed_answer", callSid=call_sid, text=gate.strip()
                     )
+                    # Only the ask path consumes the cap. A punctuated question
+                    # is allowed by _caller_asked on its own merits, so it must
+                    # not spend the allowance a later unpunctuated ask needs.
+                    if (
+                        not _caller_asked(user_text)
+                        and WEBSITE_ASK_RE.search(user_text or "")
+                        and WEBSITE_RE.search(gate)
+                    ):
+                        state["website_ask_uses"] = website_ask_uses + 1
                 else:
                     log_event("repeat_guard", callSid=call_sid, text=gate.strip())
                     replacement = REPEAT_FALLBACKS[0]
@@ -4382,6 +4906,14 @@ async def relay_ws(websocket: WebSocket) -> None:
                     "",
                 )
                 closing = bool(CLOSING_RE.search(user_text))
+                # At most WEBSITE_ASK_MAX consecutive exempted website repeats.
+                # The count PERSISTS across turns and is cleared only by a turn
+                # that does not ask for the address: clearing it every turn made
+                # the cap unreachable, because a turn can only spend one use.
+                website_ask_uses = state["website_ask_uses"]
+                if not WEBSITE_ASK_RE.search(user_text or ""):
+                    website_ask_uses = 0
+                    state["website_ask_uses"] = 0
                 try:
                     llm_task = asyncio.create_task(
                         send_text_tokens(
@@ -4393,6 +4925,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                             user_text=user_text,
                             website_spoken=state["website_spoken"],
                             callback_declined=state["callback_declined"],
+                            website_ask_uses=website_ask_uses,
                         )
                     )
                     reply = ""
@@ -4537,8 +5070,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                         # is the fix; another negative rule is not.
                         _swap_to_after_pitch(history, state, call_sid)
                     if is_repeat(prev_assistant, reply.strip()) and not (
-                        CLOSING_RE.search(reply)
-                        or (_caller_asked(user_text) and not _pitch_delivered(reply))
+                        repeat_allowed(reply, user_text)
                     ):
                         # History-level backstop only: the caller has already
                         # heard this reply, so this keeps the model from
